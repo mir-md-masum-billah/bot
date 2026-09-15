@@ -3,7 +3,6 @@ import { dbConnect } from "../lib/db.js";
 import User from "../models/User.js";
 import Task from "../models/Task.js";
 import Transaction from "../models/Transaction.js";
-import Chat from "../models/Chat.js";
 import {
   mainMenu,
   replyMainMenu,
@@ -15,14 +14,7 @@ import {
   earnActionMenu,
   adminStatusReplyMenu,
   addBotMenu,
-  chatPickerMenu,
 } from "./keyboards.js";
-
-// Telegram gives channels the type "channel", but groups/supergroups come
-// back as "group" or "supergroup" — normalize both to our own "group".
-function normalizeChatType(telegramChatType) {
-  return telegramChatType === "channel" ? "channel" : "group";
-}
 
 const COMMISSION_PERCENT = Number(process.env.EARNED_COMMISSION_PERCENT || 10);
 
@@ -149,105 +141,6 @@ async function isUserMemberOf(chatId, userId) {
     return false;
   }
 }
-
-async function isUserAdminOf(chatId, userId) {
-  try {
-    const member = await bot.telegram.getChatMember(chatId, userId);
-    return ["administrator", "creator"].includes(member.status);
-  } catch (e) {
-    // Chat deleted, bot kicked, or user left — treat as "can't confirm admin".
-    return false;
-  }
-}
-
-// Builds the "🏠 I'm an admin" / "👁 I'm not an admin" picker list from
-// chats WE ALREADY KNOW ABOUT (see the my_chat_member handler below).
-// There is no Bot API call that returns "every chat this Telegram user
-// administers" — a bot can only introspect membership for chats it has
-// itself already joined, so this list can never be a full account-wide
-// picker the way Telegram's own native add-to-chat dialog is.
-async function showChatPicker(ctx, user, type, wantAdmin) {
-  await dbConnect();
-  const candidates = await Chat.find({ type, isBotActive: true }).limit(200);
-
-  const matches = [];
-  for (const chat of candidates) {
-    const isAdmin = await isUserAdminOf(chat.chatId, ctx.from.id);
-    if (isAdmin === wantAdmin) matches.push(chat);
-  }
-
-  if (!matches.length) {
-    await ctx.reply(
-      wantAdmin
-        ? `⚠️ Emon kono ${type} pawa jayni jekhane ami (bot) age theke add ache ar apni admin. ` +
-            `Age amake oi ${type}-ta te admin banan, tarpor "🏠 I'm an admin" abar try korun.`
-        : `⚠️ Emon kono ${type} pawa jayni jekhane ami (bot) age theke add ache ar apni admin na. ` +
-            `Note: ami sudhu segulo dekhate pari jegulote amake age theke add kora hoyeche — ` +
-            `notun kono chat er khoje ei list e ashbe na.`,
-      replyMainMenu()
-    );
-    return;
-  }
-
-  await setSession(user, "picking_chat", { type });
-  await ctx.reply(
-    `👇 Niche theke ${type === "channel" ? "channel" : "group"}-ta select korun:`,
-    chatPickerMenu(matches)
-  );
-}
-
-bot.action(/pick_chat_(.+)/, async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  await ctx.answerCbQuery();
-  if (user.sessionState !== "picking_chat") return;
-  const { type } = user.sessionData;
-
-  await dbConnect();
-  const chat = await Chat.findById(ctx.match[1]);
-  if (!chat) {
-    await ctx.reply("Chat-ta ar khuje pawa jayni. Abar list dekhun.");
-    return;
-  }
-
-  await setSession(user, "awaiting_price", {
-    type,
-    targetChatId: chat.chatId,
-    targetChatTitle: chat.title,
-    targetChatUsername: chat.username,
-  });
-  await ctx.editMessageText(
-    `${TYPE_LABELS[type]} selected — ${chat.title || chat.username || chat.chatId}\n\n` +
-      `💡 Send the price (in coins) you want to pay per completion.\n` +
-      `Tip: check the "Earn" section for current prices — higher prices get completed faster.`
-  );
-});
-
-// Tracks every chat the bot itself is added to / removed from / promoted
-// in, so the pickers above have something to search. Fires on ANY change
-// to the bot's own membership status in a chat.
-bot.on("my_chat_member", async (ctx) => {
-  try {
-    await dbConnect();
-    const update = ctx.myChatMember;
-    const chat = update.chat;
-    const status = update.new_chat_member.status;
-    const isActive = ["administrator", "member", "creator"].includes(status);
-
-    await Chat.findOneAndUpdate(
-      { chatId: String(chat.id) },
-      {
-        chatId: String(chat.id),
-        type: normalizeChatType(chat.type),
-        title: chat.title,
-        username: chat.username,
-        isBotActive: isActive,
-      },
-      { upsert: true }
-    );
-  } catch (e) {
-    console.error("Failed to track my_chat_member update:", e);
-  }
-});
 
 // Deletes the bot's previous menu message (if any) before sending a new
 // one, then remembers the new message id. Keeps the chat from filling up
@@ -378,48 +271,38 @@ bot.action(/promote_(channel|group)/, async (ctx) => {
   );
 });
 
-// "🏠 I'm an admin" — show a list of chats (of the type already chosen)
-// that the bot already knows about, filtered to the ones THIS user is
-// admin/creator of. Tapping one jumps straight to the price step with
-// that chat locked in (see pick_chat_ handler above).
+// "🏠 I'm an admin" — proceed straight to the price step.
 bot.hears("🏠 I'm an admin", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await tryDeleteUserMessage(ctx);
   if (user.sessionState !== "choosing_admin_status") return;
   const { type } = user.sessionData;
-  await showChatPicker(ctx, user, type, true);
+  await setSession(user, "awaiting_price", { type });
+  await ctx.reply(
+    `${TYPE_LABELS[type]} selected.\n\n` +
+      `💡 Send the price (in coins) you want to pay per completion.\n` +
+      `Tip: check the "Earn" section for current prices — higher prices get completed faster.`,
+    replyMainMenu()
+  );
 });
 
-// "👁 I'm not an admin" — same list, but filtered to chats the bot knows
-// about where this user is NOT admin/creator.
-//
-// IMPORTANT LIMITATION: both lists can only ever contain chats the bot has
-// already been added to at some point (tracked via my_chat_member below).
-// There is no Telegram Bot API call that returns "every chat this user
-// administers" across their whole account — only Telegram's own native
-// add-to-chat dialog (used previously here) can show that. If the chat the
-// user actually wants isn't in the list yet, they still need to add the
-// bot to it first — offer that as a fallback.
+// "👁 I'm not an admin" — show a button that opens Telegram's own
+// add-to-channel/add-to-group picker. Telegram (not this bot) lists every
+// channel/group the user administers and lets them grant admin rights to
+// the bot in one tap — a bot has no API to fetch that list itself, so this
+// native picker is the only way to offer a "choose from your channels" flow.
 bot.hears("👁 I'm not an admin", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await tryDeleteUserMessage(ctx);
   if (user.sessionState !== "choosing_admin_status") return;
   const { type } = user.sessionData;
-  await showChatPicker(ctx, user, type, false);
-});
-
-// Fallback for when the wanted chat isn't in either list yet — opens
-// Telegram's native add-to-channel/add-to-group picker so the user can add
-// the bot somewhere new. Kept as an explicit escape hatch since the two
-// pickers above are limited to chats already known to the bot.
-bot.hears("➕ Add me to a new chat", async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  await tryDeleteUserMessage(ctx);
-  if (user.sessionState !== "choosing_admin_status") return;
-  const { type } = user.sessionData;
+  await ctx.reply(
+    `⚠️ Okay — let's add me as an admin to your ${type} first.`,
+    replyMainMenu()
+  );
   const botUsername = await getBotUsername();
   await ctx.reply(
-    `➕ Tap the button below to add me to your ${type}.\n\n` +
+    `➕ Tap the button below to add me as an admin to your ${type}.\n\n` +
       `Telegram will show you a list of the ${type}s you manage — pick one and ` +
       `confirm the admin permissions. Then come back here and tap "I've added it".`,
     addBotMenu(type, botUsername)
@@ -781,7 +664,7 @@ bot.action(/count_(\d+)/, async (ctx) => {
 });
 
 async function finalizeCount(ctx, user, count) {
-  const { type, price, targetChatId, targetChatTitle, targetChatUsername } = user.sessionData;
+  const { type, price } = user.sessionData;
   const totalCost = price * count;
   const available = user.donatedBalance + user.earnedBalance;
 
@@ -792,20 +675,6 @@ async function finalizeCount(ctx, user, count) {
         `(plus commission if paid from earned coins). Your balance: ${available}.`,
       mainMenu()
     );
-    return;
-  }
-
-  // Chat was already picked from a "🏠 I'm an admin" / "👁 I'm not an
-  // admin" list earlier — skip the forward/@username step entirely.
-  if (targetChatId) {
-    await createTask(ctx, user, {
-      type,
-      price,
-      count,
-      chatId: targetChatId,
-      chatTitle: targetChatTitle,
-      chatUsername: targetChatUsername,
-    });
     return;
   }
 
@@ -834,6 +703,15 @@ async function handleChatInput(ctx, user, message) {
     return;
   }
 
+  const adminOk = await isBotAdminIn(chatId);
+  if (!adminOk) {
+    await ctx.reply(
+      "⚠️ I'm not an admin there yet. Please add me as an administrator " +
+        "(with 'invite users via link' permission) and send the chat again."
+    );
+    return;
+  }
+
   let chatInfo;
   try {
     chatInfo = await bot.telegram.getChat(chatId);
@@ -842,34 +720,8 @@ async function handleChatInput(ctx, user, message) {
     return;
   }
 
-  const { type, price, count } = user.sessionData;
-  await createTask(ctx, user, {
-    type,
-    price,
-    count,
-    chatId: String(chatId),
-    chatTitle: chatInfo.title,
-    chatUsername: chatInfo.username,
-  });
-}
-
-// Shared task-creation step used both when the chat came from a
-// "🏠 I'm an admin" / "👁 I'm not an admin" picker list and when it came
-// from a forwarded message / @username. Always re-checks that the bot is
-// currently an admin there (a picker entry can go stale — admin rights can
-// be revoked any time after the chat was first tracked).
-async function createTask(ctx, user, { type, price, count, chatId, chatTitle, chatUsername }) {
-  const adminOk = await isBotAdminIn(chatId);
-  if (!adminOk) {
-    await ctx.reply(
-      "⚠️ I'm not an admin there (anymore). Please add me as an administrator " +
-        "(with 'invite users via link' permission) and try again."
-    );
-    await clearSession(user);
-    return;
-  }
-
   await dbConnect();
+  const { type, price, count } = user.sessionData;
   const spend = await spendForTask(user, price * count);
   if (!spend.ok) {
     await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} coins.`);
@@ -880,8 +732,8 @@ async function createTask(ctx, user, { type, price, count, chatId, chatTitle, ch
     ownerTelegramId: user.telegramId,
     type,
     targetChatId: String(chatId),
-    targetChatTitle: chatTitle,
-    targetChatUsername: chatUsername,
+    targetChatTitle: chatInfo.title,
+    targetChatUsername: chatInfo.username,
     pricePerAction: price,
     goalCount: count,
   });
@@ -889,7 +741,7 @@ async function createTask(ctx, user, { type, price, count, chatId, chatTitle, ch
   await clearSession(user);
   await ctx.reply(
     `✅ Task created!\n\n` +
-      `${TYPE_LABELS[type]} — ${chatTitle || chatUsername}\n` +
+      `${TYPE_LABELS[type]} — ${chatInfo.title || chatUsername}\n` +
       `Price: ${price} coins × ${count} = ${price * count} coins` +
       (spend.commission ? ` (+${spend.commission} commission)` : "") +
       `\n\nTrack it under 🗂 My Cabinet → My Tasks.`,

@@ -89,12 +89,7 @@ export const earnActionMenu = (taskId) =>
 // wants to promote. Persistent reply keyboard (not inline) to match the
 // app's native full-width button style for this step.
 export const adminStatusReplyMenu = () =>
-  Markup.keyboard([
-    ["🏠 I'm an admin"],
-    ["👁 I'm not an admin"],
-    ["➕ Add me to a new chat"],
-    ["⬅️ Back"],
-  ]).resize();
+  Markup.keyboard([["🏠 I'm an admin"], ["👁 I'm not an admin"], ["⬅️ Back"]]).resize();
 
 // Telegram's `startchannel` / `startgroup` deep links open Telegram's own
 // native picker of every channel/group the user administers, and let them
@@ -111,16 +106,3 @@ export const addBotMenu = (type, botUsername) => {
     [Markup.button.callback("⬅️ Back", "menu_promote")],
   ]);
 };
-
-// List of chats (of a given type) the bot already knows about — built from
-// our own Chat collection, not from Telegram, since there's no API call
-// that lists "every chat this user administers". One button per chat;
-// callback carries the chat's Mongo _id so we don't hit Telegram button
-// data-length limits with long chat ids/titles.
-export const chatPickerMenu = (chats) =>
-  Markup.inlineKeyboard([
-    ...chats.map((c) => [
-      Markup.button.callback(c.title || c.username || c.chatId, `pick_chat_${c._id}`),
-    ]),
-    [Markup.button.callback("⬅️ Back", "menu_promote")],
-  ]);
