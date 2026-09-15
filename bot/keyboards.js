@@ -20,12 +20,23 @@ export const replyMainMenu = () =>
 
 export const promoteTypeMenu = () =>
   Markup.inlineKeyboard([
-    [Markup.button.callback("📢 Channel", "promote_channel")],
-    [Markup.button.callback("👥 Group", "promote_group")],
-    [Markup.button.callback("👀 Views", "promote_views")],
-    [Markup.button.callback("🤖 Bot", "promote_bot")],
-    [Markup.button.callback("⚡️ Premium Boost", "promote_boost")],
-    [Markup.button.callback("⬅️ Back", "menu_main")],
+    [
+      Markup.button.callback("📢 Channel", "promote_channel"),
+      Markup.button.callback("👥 Group", "promote_group"),
+    ],
+    [
+      Markup.button.callback("👁 Post", "promote_views"),
+      Markup.button.callback("🤖 Bot", "promote_bot"),
+    ],
+    [
+      Markup.button.callback("⚡️ Premium boost (channel)", "promote_boost"),
+      Markup.button.callback("❤️ Reactions", "promote_reactions"),
+    ],
+    [Markup.button.callback("⚙️ Auto-task settings", "promote_auto_settings")],
+    [
+      Markup.button.callback("📋 My Tasks", "cabinet_tasks"),
+      Markup.button.callback("⬅️ Back", "menu_main"),
+    ],
   ]);
 
 export const earnTypeMenu = () =>

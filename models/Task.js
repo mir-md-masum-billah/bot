@@ -6,7 +6,7 @@ const TaskSchema = new mongoose.Schema(
 
     type: {
       type: String,
-      enum: ["channel", "group", "views", "bot", "boost"],
+      enum: ["channel", "group", "views", "bot", "boost", "reactions"],
       required: true,
     },
 
