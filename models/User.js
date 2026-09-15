@@ -21,6 +21,12 @@ const UserSchema = new mongoose.Schema(
     // (e.g. "waiting for subscriber count", "waiting for chat forward")
     sessionState: { type: String, default: null },
     sessionData: { type: mongoose.Schema.Types.Mixed, default: {} },
+
+    // The message_id of the bot's last menu/reply in this chat, used to
+    // delete it before sending the next one (keeps the chat clean).
+    // Note: Telegram only lets bots delete their OWN messages in private
+    // chats — a user's own sent messages can never be deleted by the bot.
+    lastMenuMessageId: { type: Number, default: null },
   },
   { timestamps: true }
 );

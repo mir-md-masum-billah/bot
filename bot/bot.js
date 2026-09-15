@@ -125,12 +125,45 @@ async function isUserMemberOf(chatId, userId) {
   }
 }
 
+// Deletes the bot's previous menu message (if any) before sending a new
+// one, then remembers the new message id. Keeps the chat from filling up
+// with old menus every time the user taps a reply-keyboard button.
+async function sendClean(ctx, user, text, extra) {
+  if (user.lastMenuMessageId) {
+    try {
+      await bot.telegram.deleteMessage(ctx.chat.id, user.lastMenuMessageId);
+    } catch (e) {
+      // Already deleted, too old (48h+), or the bot lacks permission — ignore.
+    }
+  }
+  const sent = await ctx.reply(text, extra);
+  user.lastMenuMessageId = sent.message_id;
+  await user.save();
+  return sent;
+}
+
+// Best-effort deletion of the user's own triggering message. Telegram only
+// allows this in groups/supergroups where the bot is an admin with delete
+// rights — in private chats a bot can NEVER delete a message the user sent,
+// so this silently does nothing there. This is a Telegram platform rule,
+// not something that can be worked around from bot code.
+async function tryDeleteUserMessage(ctx) {
+  try {
+    await ctx.deleteMessage();
+  } catch (e) {
+    // no-op
+  }
+}
+
 // ---------- commands ----------
 
 bot.start(async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await clearSession(user);
-  await ctx.reply(
+  await tryDeleteUserMessage(ctx);
+  await sendClean(
+    ctx,
+    user,
     `👋 Welcome to the Promotion Bot!\n\n` +
       `📢 Promote your channel/group/bot using coins.\n` +
       `💰 Earn coins by subscribing to others' channels and completing tasks.\n\n` +
@@ -339,15 +372,20 @@ bot.action(/verify_(.+)/, async (ctx) => {
 bot.hears("📢 Promote", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await clearSession(user);
-  await ctx.reply("📢 What would you like to promote?", promoteTypeMenu());
+  await tryDeleteUserMessage(ctx);
+  await sendClean(ctx, user, "📢 What would you like to promote?", promoteTypeMenu());
 });
 
 bot.hears("💰 Earnings", async (ctx) => {
-  await ctx.reply("💰 Choose a category to earn coins:", earnTypeMenu());
+  const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
+  await sendClean(ctx, user, "💰 Choose a category to earn coins:", earnTypeMenu());
 });
 
 bot.hears("👤 My Cabinet", async (ctx) => {
-  await ctx.reply("🗂 My Cabinet", cabinetMenu());
+  const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
+  await sendClean(ctx, user, "🗂 My Cabinet", cabinetMenu());
 });
 
 bot.hears("✅ Subscription Check", async (ctx) => {
@@ -355,6 +393,8 @@ bot.hears("✅ Subscription Check", async (ctx) => {
   // recheck / grab the next available task without navigating the menu.
   await dbConnect();
   const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
+
   const task = await Task.findOne({
     type: { $in: ["channel", "group"] },
     status: "active",
@@ -364,11 +404,13 @@ bot.hears("✅ Subscription Check", async (ctx) => {
   }).sort({ pricePerAction: -1 });
 
   if (!task) {
-    await ctx.reply("No available subscription tasks right now. Check back later!");
+    await sendClean(ctx, user, "No available subscription tasks right now. Check back later!");
     return;
   }
 
-  await ctx.reply(
+  await sendClean(
+    ctx,
+    user,
     `${TYPE_LABELS[task.type]}\n` +
       `${task.targetChatTitle || task.targetChatUsername || task.targetChatId}\n\n` +
       `💰 Reward: ${task.pricePerAction} coins\n\n` +
@@ -379,12 +421,15 @@ bot.hears("✅ Subscription Check", async (ctx) => {
 
 bot.hears("📤 Checks", async (ctx) => {
   const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
   const total = user.donatedBalance + user.earnedBalance;
   // NOTE: this is informational only — no automatic payout is wired up yet.
   // To turn this into a real withdrawal system you'd add a WithdrawalRequest
   // model, let the user submit a payment method/amount here, and review
   // requests from the admin dashboard before paying out and deducting coins.
-  await ctx.reply(
+  await sendClean(
+    ctx,
+    user,
     `📤 Withdrawal / Checks\n\n` +
       `💳 Your current balance: ${total} coins\n\n` +
       `Withdrawal requests aren't automated yet in this build. ` +
@@ -395,12 +440,16 @@ bot.hears("📤 Checks", async (ctx) => {
 
 bot.hears("📊 Our Bots and Statistics", async (ctx) => {
   await dbConnect();
+  const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
   const [userCount, activeTasks, completedTasks] = await Promise.all([
     User.countDocuments({}),
     Task.countDocuments({ status: "active" }),
     Task.countDocuments({ status: "completed" }),
   ]);
-  await ctx.reply(
+  await sendClean(
+    ctx,
+    user,
     `📊 Bot Statistics\n\n` +
       `👥 Total users: ${userCount}\n` +
       `🟢 Active tasks: ${activeTasks}\n` +
@@ -409,8 +458,12 @@ bot.hears("📊 Our Bots and Statistics", async (ctx) => {
 });
 
 bot.hears("🔗 Useful Links", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
   // Customize these with your own channel/support/group links.
-  await ctx.reply(
+  await sendClean(
+    ctx,
+    user,
     `🔗 Useful Links\n\n` +
       `📢 Updates channel: https://t.me/your_channel\n` +
       `💬 Support: https://t.me/your_support_username\n` +
@@ -419,7 +472,11 @@ bot.hears("🔗 Useful Links", async (ctx) => {
 });
 
 bot.hears("ℹ️ Instruction", async (ctx) => {
-  await ctx.reply(
+  const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
+  await sendClean(
+    ctx,
+    user,
     `ℹ️ How this bot works\n\n` +
       `📢 Promote — spend coins to get real subscribers/views for your channel, group, or bot.\n` +
       `💰 Earnings — join other people's channels/groups to earn coins.\n` +
