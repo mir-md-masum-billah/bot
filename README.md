@@ -117,4 +117,3 @@ npm run dev          # runs the Next.js app at http://localhost:3000
 For local bot testing you'll need a public HTTPS tunnel (e.g. `ngrok http 3000`) since
 Telegram can't reach `localhost` — set `PUBLIC_URL` to the ngrok URL and re-run the
 webhook script whenever the tunnel URL changes.
-# bot

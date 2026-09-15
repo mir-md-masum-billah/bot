@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/router";
+import { dbConnect } from "../../lib/db.js";
 import { isAuthed } from "../../lib/adminAuth.js";
 
 export async function getServerSideProps({ req }) {

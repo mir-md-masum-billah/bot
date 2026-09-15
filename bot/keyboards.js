@@ -8,6 +8,16 @@ export const mainMenu = () =>
     [Markup.button.callback("💳 Balance", "menu_balance")],
   ]);
 
+// Persistent bottom keyboard (always visible under the message box),
+// matching the PR GRAM-style layout.
+export const replyMainMenu = () =>
+  Markup.keyboard([
+    ["💰 Earnings", "📢 Promote"],
+    ["📤 Checks", "👤 My Cabinet"],
+    ["✅ Subscription Check", "📊 Our Bots and Statistics"],
+    ["🔗 Useful Links", "ℹ️ Instruction"],
+  ]).resize();
+
 export const promoteTypeMenu = () =>
   Markup.inlineKeyboard([
     [Markup.button.callback("📢 Channel", "promote_channel")],

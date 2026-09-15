@@ -5,6 +5,7 @@ import Task from "../models/Task.js";
 import Transaction from "../models/Transaction.js";
 import {
   mainMenu,
+  replyMainMenu,
   promoteTypeMenu,
   earnTypeMenu,
   subscriberCountMenu,
@@ -134,7 +135,7 @@ bot.start(async (ctx) => {
       `📢 Promote your channel/group/bot using coins.\n` +
       `💰 Earn coins by subscribing to others' channels and completing tasks.\n\n` +
       `💳 Balance: ${user.donatedBalance + user.earnedBalance} coins`,
-    mainMenu()
+    replyMainMenu()
   );
 });
 
@@ -331,6 +332,102 @@ bot.action(/verify_(.+)/, async (ctx) => {
 
   await ctx.answerCbQuery("✅ Verified! Coins added.", { show_alert: true });
   await ctx.editMessageText(`✅ Success! +${task.pricePerAction} coins credited.`);
+});
+
+// ---------- persistent reply-keyboard buttons ----------
+
+bot.hears("📢 Promote", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await clearSession(user);
+  await ctx.reply("📢 What would you like to promote?", promoteTypeMenu());
+});
+
+bot.hears("💰 Earnings", async (ctx) => {
+  await ctx.reply("💰 Choose a category to earn coins:", earnTypeMenu());
+});
+
+bot.hears("👤 My Cabinet", async (ctx) => {
+  await ctx.reply("🗂 My Cabinet", cabinetMenu());
+});
+
+bot.hears("✅ Subscription Check", async (ctx) => {
+  // Shortcut: jump straight into the "subscribe" earn flow so the user can
+  // recheck / grab the next available task without navigating the menu.
+  await dbConnect();
+  const user = await getOrCreateUser(ctx);
+  const task = await Task.findOne({
+    type: { $in: ["channel", "group"] },
+    status: "active",
+    ownerTelegramId: { $ne: user.telegramId },
+    completedBy: { $ne: user.telegramId },
+    $expr: { $lt: ["$completedCount", "$goalCount"] },
+  }).sort({ pricePerAction: -1 });
+
+  if (!task) {
+    await ctx.reply("No available subscription tasks right now. Check back later!");
+    return;
+  }
+
+  await ctx.reply(
+    `${TYPE_LABELS[task.type]}\n` +
+      `${task.targetChatTitle || task.targetChatUsername || task.targetChatId}\n\n` +
+      `💰 Reward: ${task.pricePerAction} coins\n\n` +
+      `1. Open and join/subscribe.\n2. Come back and tap Check.`,
+    earnActionMenu(task._id.toString())
+  );
+});
+
+bot.hears("📤 Checks", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  const total = user.donatedBalance + user.earnedBalance;
+  // NOTE: this is informational only — no automatic payout is wired up yet.
+  // To turn this into a real withdrawal system you'd add a WithdrawalRequest
+  // model, let the user submit a payment method/amount here, and review
+  // requests from the admin dashboard before paying out and deducting coins.
+  await ctx.reply(
+    `📤 Withdrawal / Checks\n\n` +
+      `💳 Your current balance: ${total} coins\n\n` +
+      `Withdrawal requests aren't automated yet in this build. ` +
+      `Contact the admin directly to cash out, or extend the bot with a ` +
+      `withdrawal-request feature if you want this self-service.`
+  );
+});
+
+bot.hears("📊 Our Bots and Statistics", async (ctx) => {
+  await dbConnect();
+  const [userCount, activeTasks, completedTasks] = await Promise.all([
+    User.countDocuments({}),
+    Task.countDocuments({ status: "active" }),
+    Task.countDocuments({ status: "completed" }),
+  ]);
+  await ctx.reply(
+    `📊 Bot Statistics\n\n` +
+      `👥 Total users: ${userCount}\n` +
+      `🟢 Active tasks: ${activeTasks}\n` +
+      `✅ Completed tasks: ${completedTasks}`
+  );
+});
+
+bot.hears("🔗 Useful Links", async (ctx) => {
+  // Customize these with your own channel/support/group links.
+  await ctx.reply(
+    `🔗 Useful Links\n\n` +
+      `📢 Updates channel: https://t.me/your_channel\n` +
+      `💬 Support: https://t.me/your_support_username\n` +
+      `👥 Community group: https://t.me/your_group`
+  );
+});
+
+bot.hears("ℹ️ Instruction", async (ctx) => {
+  await ctx.reply(
+    `ℹ️ How this bot works\n\n` +
+      `📢 Promote — spend coins to get real subscribers/views for your channel, group, or bot.\n` +
+      `💰 Earnings — join other people's channels/groups to earn coins.\n` +
+      `👤 My Cabinet — manage the tasks you created (pause/resume/delete).\n` +
+      `✅ Subscription Check — quickly grab and verify the next available task.\n` +
+      `📤 Checks — see your balance and request a withdrawal.\n\n` +
+      `💡 Tip: price your task competitively (check 💰 Earnings to see going rates) so it gets completed faster.`
+  );
 });
 
 // ---------- text input (price / count / chat) ----------
