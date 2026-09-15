@@ -84,3 +84,25 @@ export const earnActionMenu = (taskId) =>
     [Markup.button.callback("✅ I've done it — Check", `verify_${taskId}`)],
     [Markup.button.callback("⏭ Skip", "earn_sub")],
   ]);
+
+// Ask whether the bot is already an admin in the channel/group the user
+// wants to promote. Persistent reply keyboard (not inline) to match the
+// app's native full-width button style for this step.
+export const adminStatusReplyMenu = () =>
+  Markup.keyboard([["🏠 I'm an admin"], ["👁 I'm not an admin"], ["⬅️ Back"]]).resize();
+
+// Telegram's `startchannel` / `startgroup` deep links open Telegram's own
+// native picker of every channel/group the user administers, and let them
+// grant the requested admin rights to the bot in one tap. This is Telegram
+// UI, not something a bot can build itself — there is no Bot API call that
+// returns "which chats does this user manage".
+export const addBotMenu = (type, botUsername) => {
+  const rights = "invite_users"; // minimal right needed for getChatMember checks
+  const param = type === "channel" ? "startchannel" : "startgroup";
+  const url = `https://t.me/${botUsername}?${param}=addadmin&admin=${rights}`;
+  return Markup.inlineKeyboard([
+    [Markup.button.url(`➕ Add to ${type === "channel" ? "Channel" : "Group"}`, url)],
+    [Markup.button.callback("✅ I've added it — Continue", `admin_yes_${type}`)],
+    [Markup.button.callback("⬅️ Back", "menu_promote")],
+  ]);
+};

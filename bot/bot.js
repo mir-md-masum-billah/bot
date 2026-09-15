@@ -12,12 +12,28 @@ import {
   cabinetMenu,
   taskManageMenu,
   earnActionMenu,
+  adminStatusReplyMenu,
+  addBotMenu,
 } from "./keyboards.js";
 
 const COMMISSION_PERCENT = Number(process.env.EARNED_COMMISSION_PERCENT || 10);
 
+// Turn the "delete old menu / delete user's message" behavior on or off in
+// one place. Set back to true to re-enable auto-delete later.
+const AUTO_DELETE_MESSAGES = false;
+
 // A single Telegraf instance is reused across warm serverless invocations.
 export const bot = new Telegraf(process.env.BOT_TOKEN);
+
+// Cached so we don't call getMe() on every single deep-link build.
+let cachedBotUsername = null;
+async function getBotUsername() {
+  if (!cachedBotUsername) {
+    const me = await bot.telegram.getMe();
+    cachedBotUsername = me.username;
+  }
+  return cachedBotUsername;
+}
 
 const TYPE_LABELS = {
   channel: "📢 Channel",
@@ -130,7 +146,7 @@ async function isUserMemberOf(chatId, userId) {
 // one, then remembers the new message id. Keeps the chat from filling up
 // with old menus every time the user taps a reply-keyboard button.
 async function sendClean(ctx, user, text, extra) {
-  if (user.lastMenuMessageId) {
+  if (AUTO_DELETE_MESSAGES && user.lastMenuMessageId) {
     try {
       await bot.telegram.deleteMessage(ctx.chat.id, user.lastMenuMessageId);
     } catch (e) {
@@ -149,6 +165,7 @@ async function sendClean(ctx, user, text, extra) {
 // so this silently does nothing there. This is a Telegram platform rule,
 // not something that can be worked around from bot code.
 async function tryDeleteUserMessage(ctx) {
+  if (!AUTO_DELETE_MESSAGES) return;
   try {
     await ctx.deleteMessage();
   } catch (e) {
@@ -221,8 +238,9 @@ bot.action("menu_cabinet", async (ctx) => {
 
 // ---------- promote flow ----------
 
-bot.action(/promote_(channel|group|views|bot|boost|reactions)/, async (ctx) => {
-  const type = ctx.match[1];
+// Shared "ask for price" step, used once we know (or the user has
+// confirmed) that the bot is an admin in the target chat.
+async function startPriceFlow(ctx, type) {
   const user = await getOrCreateUser(ctx);
   await setSession(user, "awaiting_price", { type });
   await ctx.editMessageText(
@@ -230,6 +248,87 @@ bot.action(/promote_(channel|group|views|bot|boost|reactions)/, async (ctx) => {
       `💡 Send the price (in coins) you want to pay per completion.\n` +
       `Tip: check the "Earn" section for current prices — higher prices get completed faster.`
   );
+}
+
+// Views/Bot/Boost/Reactions go straight to the price step, same as before.
+bot.action(/promote_(views|bot|boost|reactions)/, async (ctx) => {
+  await startPriceFlow(ctx, ctx.match[1]);
+});
+
+// Channel/Group first ask whether the bot is already an admin there, since
+// that's a hard requirement (see isBotAdminIn) before a task can go live.
+// This step uses a persistent reply keyboard (not inline buttons), matching
+// the target UI, so it's handled by the bot.hears() handlers below rather
+// than bot.action().
+bot.action(/promote_(channel|group)/, async (ctx) => {
+  const type = ctx.match[1];
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  await setSession(user, "choosing_admin_status", { type });
+  await ctx.reply(
+    "📢 Choose a chat or channel to promote (the bot must be an admin)",
+    adminStatusReplyMenu()
+  );
+});
+
+// "🏠 I'm an admin" — proceed straight to the price step.
+bot.hears("🏠 I'm an admin", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
+  if (user.sessionState !== "choosing_admin_status") return;
+  const { type } = user.sessionData;
+  await setSession(user, "awaiting_price", { type });
+  await ctx.reply(
+    `${TYPE_LABELS[type]} selected.\n\n` +
+      `💡 Send the price (in coins) you want to pay per completion.\n` +
+      `Tip: check the "Earn" section for current prices — higher prices get completed faster.`,
+    replyMainMenu()
+  );
+});
+
+// "👁 I'm not an admin" — show a button that opens Telegram's own
+// add-to-channel/add-to-group picker. Telegram (not this bot) lists every
+// channel/group the user administers and lets them grant admin rights to
+// the bot in one tap — a bot has no API to fetch that list itself, so this
+// native picker is the only way to offer a "choose from your channels" flow.
+bot.hears("👁 I'm not an admin", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
+  if (user.sessionState !== "choosing_admin_status") return;
+  const { type } = user.sessionData;
+  await ctx.reply(
+    `⚠️ Okay — let's add me as an admin to your ${type} first.`,
+    replyMainMenu()
+  );
+  const botUsername = await getBotUsername();
+  await ctx.reply(
+    `➕ Tap the button below to add me as an admin to your ${type}.\n\n` +
+      `Telegram will show you a list of the ${type}s you manage — pick one and ` +
+      `confirm the admin permissions. Then come back here and tap "I've added it".`,
+    addBotMenu(type, botUsername)
+  );
+});
+
+// "⬅️ Back" from the admin-status reply keyboard — return to the promote
+// type menu and restore the normal persistent keyboard.
+bot.hears("⬅️ Back", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
+  if (user.sessionState !== "choosing_admin_status") return;
+  await clearSession(user);
+  const total = user.donatedBalance + user.earnedBalance;
+  await ctx.reply(
+    `📢 What do you want to promote?\n\n💰 Balance: ${total.toLocaleString()} GRAM`,
+    replyMainMenu()
+  );
+  await ctx.reply("👇 Pick a type:", promoteTypeMenu());
+});
+
+// "✅ I've added it — Continue" (inline button shown alongside the
+// "➕ Add to Channel/Group" link) — proceed to price step.
+bot.action(/admin_yes_(channel|group)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await startPriceFlow(ctx, ctx.match[1]);
 });
 
 bot.action("promote_auto_settings", async (ctx) => {
