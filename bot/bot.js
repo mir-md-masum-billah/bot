@@ -849,15 +849,44 @@ const MIN_STAY_MS = MIN_STAY_DAYS * 24 * 60 * 60 * 1000;
 
 const EARN_TYPE_MAP = { sub: ["channel", "group"], views: ["views"], bot: ["bot"] };
 
+// Resolves the public base URL used to build the WebApp verify link.
+// Priority: explicit PUBLIC_URL env var -> Vercel's stable production
+// domain -> Vercel's per-deployment domain -> null (nothing usable).
+// This means even if PUBLIC_URL is forgotten in the Vercel dashboard,
+// the bot will still build a valid https:// link instead of sending
+// Telegram a bare "/verify?..." path (which Telegram rejects with
+// "URL host is empty" and silently breaks the button for the user).
+function resolvePublicUrl() {
+  if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/+$/, "");
+  if (process.env.VERCEL_PROJECT_PRODUCTION_URL) {
+    return `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
+  }
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return null;
+}
+
 function verifyUrlFor(user) {
-  const base = process.env.PUBLIC_URL || "";
+  const base = resolvePublicUrl();
+  if (!base) return null;
   return `${base}/verify?tid=${user.telegramId}`;
 }
 
 async function promptHumanVerification(ctx, user) {
+  const verifyUrl = verifyUrlFor(user);
+  if (!verifyUrl) {
+    // No usable base URL at all (shouldn't happen on Vercel, but guard
+    // anyway so we never crash the handler or send a broken button).
+    console.error(
+      "promptHumanVerification: no PUBLIC_URL/VERCEL_URL available, cannot build verify link"
+    );
+    await ctx.reply(
+      "🔒 Human verification is temporarily unavailable. Please try again in a moment or contact support."
+    );
+    return;
+  }
   await ctx.reply(
     "🔒 Please verify that you are human to keep earning.",
-    humanVerifyMenu(verifyUrlFor(user))
+    humanVerifyMenu(verifyUrl)
   );
 }
 
