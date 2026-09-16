@@ -62,7 +62,21 @@ function gramToStars(totalGram) {
 const AUTO_DELETE_MESSAGES = false;
 
 // A single Telegraf instance is reused across warm serverless invocations.
-export const bot = new Telegraf(process.env.BOT_TOKEN);
+//
+// handlerTimeout: Telegraf's default is 90s, but a Vercel function is capped
+// at 60s (and defaults to 10s), so the default guard can never fire before
+// the platform kills the invocation. 25s keeps the error inside our own logs.
+//
+// webhookReply: false — with webhook replies on, Telegraf answers the first
+// Telegram API call by writing it into the HTTP response body. On Vercel the
+// function is frozen the instant the response ends, so anything still awaited
+// after that (DB writes, follow-up sendMessage) is suspended mid-update and
+// only resumes if/when the container thaws. Every API call goes out as its
+// own request instead.
+export const bot = new Telegraf(process.env.BOT_TOKEN, {
+  handlerTimeout: 25_000,
+  telegram: { webhookReply: false },
+});
 
 // Without this, an error thrown anywhere in a handler (a bad DB write, a
 // Telegram API call failing, etc.) is only logged by Telegraf's default
