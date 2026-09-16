@@ -19,8 +19,15 @@ export default async function handler(req, res) {
     const { id, status, pricePerAction } = req.body || {};
     const update = {};
     if (status) update.status = status;
-    if (pricePerAction) update.pricePerAction = pricePerAction;
-    const task = await Task.findByIdAndUpdate(id, update, { new: true });
+    if (pricePerAction !== undefined) {
+      const price = Number(pricePerAction);
+      if (!Number.isFinite(price) || price <= 0) {
+        res.status(400).json({ error: "pricePerAction must be a positive number" });
+        return;
+      }
+      update.pricePerAction = price;
+    }
+    const task = await Task.findByIdAndUpdate(id, update, { new: true, runValidators: true });
     res.status(200).json(task);
     return;
   }

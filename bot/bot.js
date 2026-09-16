@@ -113,6 +113,10 @@ async function clearSession(user) {
 }
 
 async function creditEarned(user, amount, note, relatedTaskId) {
+  if (!Number.isFinite(amount)) {
+    console.error(`creditEarned: refusing non-finite amount (${amount}) for user ${user.telegramId}, task ${relatedTaskId}`);
+    return;
+  }
   user.earnedBalance += amount;
   await user.save();
   await Transaction.create({
@@ -129,6 +133,10 @@ async function creditEarned(user, amount, note, relatedTaskId) {
 // how much was actually deducted, so the owner is only ever credited what
 // was actually recovered.
 async function clawbackEarned(user, amount, note, relatedTaskId) {
+  if (!Number.isFinite(amount)) {
+    console.error(`clawbackEarned: refusing non-finite amount (${amount}) for user ${user.telegramId}, task ${relatedTaskId}`);
+    return 0;
+  }
   const deducted = Math.min(user.earnedBalance, amount);
   user.earnedBalance -= deducted;
   await user.save();
