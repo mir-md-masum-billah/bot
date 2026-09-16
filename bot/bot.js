@@ -513,7 +513,13 @@ bot.action("menu_promote", async (ctx) => {
 });
 
 bot.action("menu_earn", async (ctx) => {
-  await ctx.editMessageText("💰 Choose a category to earn coins:", earnTypeMenu());
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  await sendOrReplace(
+    ctx,
+    "📝 Choose a task category to earn",
+    await earnMenuFor(user.telegramId)
+  );
 });
 
 bot.action("menu_cabinet", async (ctx) => {
@@ -1596,7 +1602,86 @@ const ANTI_BOT_CHECK_INTERVAL = 10;
 const MIN_STAY_DAYS = 7;
 const MIN_STAY_MS = MIN_STAY_DAYS * 24 * 60 * 60 * 1000;
 
-const EARN_TYPE_MAP = { sub: ["channel", "group"], views: ["views"], bot: ["bot"] };
+// One entry per button on the earn screen. "sub" is kept as a combined
+// channel+group list because the "✅ Subscription Check" shortcut on the
+// bottom keyboard jumps straight into it — it isn't shown as its own
+// category button anymore.
+const EARN_TYPE_MAP = {
+  channel: ["channel"],
+  group: ["group"],
+  views: ["views"],
+  bot: ["bot"],
+  reactions: ["reactions"],
+  boost: ["boost"],
+  sub: ["channel", "group"],
+};
+
+// Every category that gets a counted button, in the order they're rendered.
+const EARN_CATEGORIES = ["channel", "group", "views", "bot", "reactions", "boost"];
+
+// Matches any category in a callback_data (used by the earn_/earnpage_/
+// earnreport_ handlers). Built from the map so adding a category here is
+// the only change needed.
+const EARN_CATEGORY_RE = Object.keys(EARN_TYPE_MAP).join("|");
+
+// How many tasks the *given user* can still take, per category — this is
+// what fills in the "· 328" on each button. It's per-user by design:
+// your own tasks and anything you already completed are excluded, exactly
+// like buildEarnFilter does for the lists themselves, so the number on the
+// button always equals the number of rows you'd actually see behind it.
+// One aggregation for all six categories, not six countDocuments calls.
+async function getEarnCounts(telegramId) {
+  const counts = Object.fromEntries(EARN_CATEGORIES.map((c) => [c, 0]));
+  try {
+    await dbConnect();
+    const rows = await Task.aggregate([
+      {
+        $match: {
+          type: { $in: EARN_CATEGORIES },
+          status: "active",
+          ownerTelegramId: { $ne: telegramId },
+          completedBy: { $ne: telegramId },
+          $expr: { $lt: ["$completedCount", "$goalCount"] },
+          // Same rule as buildEarnFilter: a post task with no stored
+          // message can never be forwarded, so it must not be counted.
+          $or: [
+            { type: { $ne: "views" } },
+            { targetMessageId: { $exists: true, $ne: null } },
+          ],
+        },
+      },
+      { $group: { _id: "$type", n: { $sum: 1 } } },
+    ]);
+    for (const row of rows) {
+      if (row._id in counts) counts[row._id] = row.n;
+    }
+  } catch (e) {
+    // A failed count shouldn't cost the user the whole menu — fall back to
+    // zeros so the buttons still render and still work when tapped.
+    console.error("getEarnCounts failed:", e);
+  }
+  return counts;
+}
+
+// Convenience wrapper: everywhere the earn menu is shown it must carry
+// fresh counts, so the two steps are always done together.
+async function earnMenuFor(telegramId) {
+  return earnTypeMenu(await getEarnCounts(telegramId));
+}
+
+// Shown by the "📋 Rules" button on the earn screen.
+const EARN_RULES_TEXT =
+  `📋 Earning rules\n\n` +
+  `⛔️ Forbidden\n` +
+  `• Unsubscribing from channels and chats earlier than ${MIN_STAY_DAYS} days.\n` +
+  `• Removing a placed reaction.\n` +
+  `• Using more than 3 accounts to earn.\n` +
+  `• Cheating on tasks — fake screenshots.\n` +
+  `• Automating tasks with software or other tools.\n\n` +
+  `❓ Penalties for violations\n` +
+  `• Task ban — 7 days.\n` +
+  `• Repeat violation — another 7 days.\n` +
+  `• Unsubscribing forfeits the full amount earned for that task.`;
 
 // Resolves the public base URL used to build the WebApp verify link.
 // Priority: explicit PUBLIC_URL env var -> Vercel's stable production
@@ -1665,7 +1750,11 @@ async function showEarnList(ctx, user, category, page = 1) {
 
   const totalCount = await Task.countDocuments(filter);
   if (!totalCount) {
-    await sendOrReplace(ctx, "No available tasks right now. Check back later!", earnTypeMenu());
+    await sendOrReplace(
+      ctx,
+      "No available tasks right now in this category. Check back later!",
+      await earnMenuFor(user.telegramId)
+    );
     return;
   }
 
@@ -1687,13 +1776,20 @@ async function showEarnList(ctx, user, category, page = 1) {
   );
 }
 
-bot.action(/earn_(sub|views|bot)/, async (ctx) => {
+// Anchored so "earn_rules" can never be swallowed by the category regex.
+bot.action(new RegExp(`^earn_(${EARN_CATEGORY_RE})$`), async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await ctx.answerCbQuery();
   await showEarnList(ctx, user, ctx.match[1], 1);
 });
 
-bot.action(/earnpage_(sub|views|bot)_(\d+)/, async (ctx) => {
+bot.action("earn_rules", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  await sendOrReplace(ctx, EARN_RULES_TEXT, await earnMenuFor(user.telegramId));
+});
+
+bot.action(new RegExp(`^earnpage_(${EARN_CATEGORY_RE})_(\\d+)$`), async (ctx) => {
   const user = await getOrCreateUser(ctx);
   const [, category, pageStr] = ctx.match;
   await ctx.answerCbQuery();
@@ -1716,7 +1812,7 @@ bot.action(/earnpage_(sub|views|bot)_(\d+)/, async (ctx) => {
   }
 });
 
-bot.action(/earnreport_(sub|views|bot)_(\d+)/, async (ctx) => {
+bot.action(new RegExp(`^earnreport_(${EARN_CATEGORY_RE})_(\\d+)$`), async (ctx) => {
   await ctx.answerCbQuery(
     "To report a task, contact support with its link — thanks for flagging it!",
     { show_alert: true }
@@ -1868,7 +1964,7 @@ bot.action("nextpost_views", async (ctx) => {
     await sendOrReplace(
       ctx,
       "😔 No more posts to view right now — check back later!",
-      earnTypeMenu(),
+      await earnMenuFor(user.telegramId),
       { forceNew: true }
     );
     return;
@@ -1951,10 +2047,15 @@ bot.action(/verify_(.+)/, async (ctx) => {
     return;
   }
 
-  const isMember =
-    task.type === "views" || task.type === "bot"
-      ? true // views/bot completion can't be verified via getChatMember; trust + admin review
-      : await isUserMemberOf(task.targetChatId, user.telegramId);
+  // getChatMember only answers "is this user in the chat" — which is not
+  // the action being paid for on post/bot/reaction/boost tasks (a reaction
+  // and a premium boost aren't readable through the Bot API at all, and a
+  // bot start happens in a different chat entirely). Those stay on trust +
+  // admin review, same as post tasks always have.
+  const UNVERIFIABLE_TYPES = ["views", "bot", "reactions", "boost"];
+  const isMember = UNVERIFIABLE_TYPES.includes(task.type)
+    ? true
+    : await isUserMemberOf(task.targetChatId, user.telegramId);
 
   if (!isMember) {
     await ctx.answerCbQuery();
@@ -2037,16 +2138,22 @@ bot.action(/verify_(.+)/, async (ctx) => {
 async function refreshEarnListInPlace(ctx, task, completingTelegramId) {
   try {
     await dbConnect();
-    const category = task.type === "views" ? "views" : task.type === "bot" ? "bot" : "sub";
-
-    // The current page is always the 3rd button of the pagination row
-    // (["1", "<", `${page}`, ">", `${totalPages}`]) — see earnTaskListMenu.
+    // Both the category and the page are read back off the pagination row
+    // (["1", "<", `${page}`, ">", `${totalPages}`] — see earnTaskListMenu)
+    // rather than derived from task.type. That matters for the combined
+    // "sub" list behind ✅ Subscription Check: a channel task completed
+    // there must refresh the channel+group list it was actually tapped in,
+    // not a channel-only list the user was never looking at.
+    let category = task.type;
     let page = 1;
     const rows = ctx.callbackQuery?.message?.reply_markup?.inline_keyboard || [];
     for (const row of rows) {
-      const match = row[2]?.callback_data?.match(/^earnpage_(?:sub|views|bot)_(\d+)$/);
+      const match = row[2]?.callback_data?.match(
+        new RegExp(`^earnpage_(${EARN_CATEGORY_RE})_(\\d+)$`)
+      );
       if (match) {
-        page = Number(match[1]);
+        category = match[1];
+        page = Number(match[2]);
         break;
       }
     }
@@ -2056,7 +2163,10 @@ async function refreshEarnListInPlace(ctx, task, completingTelegramId) {
 
     const totalCount = await Task.countDocuments(filter);
     if (!totalCount) {
-      await ctx.editMessageText("No available tasks right now. Check back later!", earnTypeMenu());
+      await ctx.editMessageText(
+        "No available tasks right now in this category. Check back later!",
+        await earnMenuFor(completingTelegramId)
+      );
       return;
     }
 
@@ -2212,7 +2322,7 @@ bot.hears("📢 Promote", async (ctx) => {
 bot.hears("💰 Earnings", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await tryDeleteUserMessage(ctx);
-  await sendClean(ctx, user, "💰 Choose a category to earn coins:", earnTypeMenu());
+  await sendClean(ctx, user, "📝 Choose a task category to earn", await earnMenuFor(user.telegramId));
 });
 
 bot.hears("👤 My Cabinet", async (ctx) => {

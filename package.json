@@ -9,7 +9,9 @@
     "set-webhook": "node -r dotenv/config scripts/setWebhook.js"
   },
   "dependencies": {
-    "mongoose": "^8.5.0",
+    "mingo": "^7.2.4",
+    "mongodb-memory-server": "^11.2.0",
+    "mongoose": "^8.24.4",
     "next": "^14.2.25",
     "react": "18.3.1",
     "react-dom": "18.3.1",

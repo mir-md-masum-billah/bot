@@ -21,13 +21,24 @@ export const replyMainMenu = () =>
 // (The old inline promoteTypeMenu was replaced by promoteTypeReplyMenu
 // below — the real app uses a persistent reply keyboard for this step.)
 
-export const earnTypeMenu = () =>
-  Markup.inlineKeyboard([
-    [Markup.button.callback("👥 Subscribe (Channel/Group)", "earn_sub")],
-    [Markup.button.callback("👀 Views", "earn_views")],
-    [Markup.button.callback("🤖 Bots", "earn_bot")],
+// The earn screen lists every category two-per-row with the number of
+// tasks the *current user* can still take in it — "📢 Channels · 328".
+// The counts are supplied by getEarnCounts() in bot.js (they're per-user,
+// so they can't be cached or hard-coded here). A missing count renders as
+// 0 rather than blowing up, so a failed count query degrades to a usable
+// menu instead of no menu at all.
+export const earnTypeMenu = (counts = {}) => {
+  const cat = (label, key, action) =>
+    Markup.button.callback(`${label} · ${(counts[key] || 0).toLocaleString()}`, action);
+
+  return Markup.inlineKeyboard([
+    [cat("📢 Channels", "channel", "earn_channel"), cat("👥 Groups", "group", "earn_group")],
+    [cat("👁 Views", "views", "earn_views"), cat("🤖 Bots", "bot", "earn_bot")],
+    [cat("❤️ Reactions", "reactions", "earn_reactions"), cat("⚡️ Boost", "boost", "earn_boost")],
+    [Markup.button.callback("📋 Rules", "earn_rules")],
     [Markup.button.callback("⬅️ Back", "menu_main")],
   ]);
+};
 
 export const subscriberCountMenu = () =>
   Markup.inlineKeyboard([
@@ -177,7 +188,20 @@ export const backToTaskMenu = (taskId) =>
 // to open and no membership to check. Tapping the button makes the bot
 // forward the promoted post straight into this chat and pay immediately,
 // so it's a single callback button per task (matching "👁 View Post +N GRAM").
+// Verb shown on the URL button, per category — "Subscribe" is wrong for a
+// bot (you start it), a reaction (you react) or a boost (you boost), and
+// the worker needs to know which action actually gets paid.
+const EARN_ACTION_VERB = {
+  channel: "Subscribe",
+  group: "Join",
+  sub: "Subscribe",
+  bot: "Start Bot",
+  reactions: "React",
+  boost: "Boost",
+};
+
 export const earnTaskListMenu = (tasks, category, page, totalPages) => {
+  const verb = EARN_ACTION_VERB[category] || "Open";
   const rows =
     category === "views"
       ? tasks.map((t) => [
@@ -188,7 +212,7 @@ export const earnTaskListMenu = (tasks, category, page, totalPages) => {
         ])
       : tasks.map((t) => [
           Markup.button.url(
-            `💲 +${t.pricePerAction} | Subscribe`,
+            `💲 +${t.pricePerAction} | ${verb}`,
             t.targetInviteLink || "https://t.me"
           ),
           Markup.button.callback("🔄 Check", `verify_${t._id}`),
