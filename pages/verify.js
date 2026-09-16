@@ -3,9 +3,12 @@ import { useEffect, useRef, useState } from "react";
 
 // Human-verification "drag the puzzle piece" widget, opened by the bot as a
 // Telegram WebApp (see humanVerifyMenu in bot/keyboards.js). Solving it
-// calls Telegram.WebApp.sendData({ verified: true }), which the bot picks
-// up as a `web_app_data` message (see bot/bot.js) and uses to re-verify the
-// user and let them keep using the "Check" button on earn tasks.
+// POSTs Telegram.WebApp.initData to /api/verify, which checks Telegram's
+// signature server-side and marks the user verified directly in the
+// database — see pages/api/verify.js for why this replaced the original
+// sendData()-based approach (sendData only works for reply-keyboard Mini
+// Apps, not the inline "Verify" button used here, so the bot never
+// actually heard about it).
 //
 // This is a simple horizontal drag-to-target puzzle, not a security
 // mechanism — it's friction against casual bots/scripts, not a real CAPTCHA
@@ -16,6 +19,7 @@ export default function Verify() {
   const [offset, setOffset] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [solved, setSolved] = useState(false);
+  const [status, setStatus] = useState("idle"); // idle | saving | done | error
   const dragStartRef = useRef({ pointerX: 0, offset: 0 });
 
   const PIECE_SIZE = 64;
@@ -37,20 +41,47 @@ export default function Verify() {
     return () => window.removeEventListener("resize", measure);
   }, []);
 
-  function reportSuccess() {
+  async function reportSuccess() {
     const tg = typeof window !== "undefined" && window.Telegram && window.Telegram.WebApp;
     setSolved(true);
     setOffset(maxOffset);
-    setTimeout(() => {
+    setTimeout(async () => {
+      const initData = tg && tg.initData;
+      if (!initData) {
+        // Opened outside Telegram (e.g. testing in a plain browser) — nothing
+        // to verify against, just no-op instead of throwing.
+        return;
+      }
+      setStatus("saving");
       try {
-        if (tg && tg.sendData) {
-          tg.sendData(JSON.stringify({ verified: true }));
+        const res = await fetch("/api/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ initData }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.ok) {
+          setStatus("done");
+          setTimeout(() => {
+            try {
+              tg.close();
+            } catch (e) {
+              // ignore
+            }
+          }, 700);
+        } else {
+          setStatus("error");
         }
-        if (tg && tg.close) tg.close();
       } catch (e) {
-        // Opened outside Telegram (e.g. testing in a plain browser) — no-op.
+        setStatus("error");
       }
     }, 650);
+  }
+
+  function retry() {
+    setSolved(false);
+    setOffset(0);
+    setStatus("idle");
   }
 
   function onPointerDown(e) {
@@ -128,7 +159,23 @@ export default function Verify() {
           )}
         </div>
 
-        <p style={styles.hint}>ⓘ Place the piece in the matching slot</p>
+        {status === "idle" && <p style={styles.hint}>ⓘ Place the piece in the matching slot</p>}
+        {status === "saving" && <p style={styles.hint}>Confirming with Telegram…</p>}
+        {status === "done" && (
+          <p style={{ ...styles.hint, color: GREEN }}>
+            ✅ Verified! Closing — go back and tap Continue.
+          </p>
+        )}
+        {status === "error" && (
+          <>
+            <p style={{ ...styles.hint, color: "#f87171" }}>
+              Couldn't confirm verification. Please try again.
+            </p>
+            <button style={styles.accessibleLink} onClick={retry}>
+              Try again
+            </button>
+          </>
+        )}
 
         {!solved && (
           <button style={styles.accessibleLink} onClick={reportSuccess}>
