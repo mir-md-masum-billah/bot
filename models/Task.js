@@ -15,6 +15,31 @@ const TaskSchema = new mongoose.Schema(
     targetChatTitle: String,
     targetChatUsername: String,
 
+    // Regular invite link (members join instantly) vs join-request link
+    // (owner must approve; worker is paid as soon as they submit the request).
+    linkType: {
+      type: String,
+      enum: ["regular", "join_request"],
+      default: "regular",
+    },
+
+    // Who the task is shown to. "premium_only" and a non-empty `languages`
+    // list both raise the minimum price per completion (see PRICE constants
+    // in bot.js) — narrower audiences complete slower, so they cost more.
+    audienceMode: {
+      type: String,
+      enum: ["all", "premium_only"],
+      default: "all",
+    },
+    languages: { type: [String], default: [] },
+
+    // How the task creation cost was paid.
+    paymentMethod: {
+      type: String,
+      enum: ["gram", "stars"],
+      default: "gram",
+    },
+
     // Coins paid to a user for each completion
     pricePerAction: { type: Number, required: true },
 

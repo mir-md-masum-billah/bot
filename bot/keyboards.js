@@ -18,26 +18,8 @@ export const replyMainMenu = () =>
     ["🔗 Useful Links", "ℹ️ Instruction"],
   ]).resize();
 
-export const promoteTypeMenu = () =>
-  Markup.inlineKeyboard([
-    [
-      Markup.button.callback("📢 Channel", "promote_channel"),
-      Markup.button.callback("👥 Group", "promote_group"),
-    ],
-    [
-      Markup.button.callback("👁 Post", "promote_views"),
-      Markup.button.callback("🤖 Bot", "promote_bot"),
-    ],
-    [
-      Markup.button.callback("⚡️ Premium boost (channel)", "promote_boost"),
-      Markup.button.callback("❤️ Reactions", "promote_reactions"),
-    ],
-    [Markup.button.callback("⚙️ Auto-task settings", "promote_auto_settings")],
-    [
-      Markup.button.callback("📋 My Tasks", "cabinet_tasks"),
-      Markup.button.callback("⬅️ Back", "menu_main"),
-    ],
-  ]);
+// (The old inline promoteTypeMenu was replaced by promoteTypeReplyMenu
+// below — the real app uses a persistent reply keyboard for this step.)
 
 export const earnTypeMenu = () =>
   Markup.inlineKeyboard([
@@ -85,24 +67,107 @@ export const earnActionMenu = (taskId) =>
     [Markup.button.callback("⏭ Skip", "earn_sub")],
   ]);
 
-// Ask whether the bot is already an admin in the channel/group the user
-// wants to promote. Persistent reply keyboard (not inline) to match the
-// app's native full-width button style for this step.
-export const adminStatusReplyMenu = () =>
-  Markup.keyboard([["🏠 I'm an admin"], ["👁 I'm not an admin"], ["⬅️ Back"]]).resize();
+// ---------- promote wizard (channel/group/post/boost/reactions) ----------
+// This whole section mirrors the real app's flow: every step here is a
+// persistent reply keyboard (full-width buttons), not inline buttons.
 
-// Telegram's `startchannel` / `startgroup` deep links open Telegram's own
-// native picker listing every channel/group the user administers, and let
-// them grant the requested admin rights to the bot in one tap. This is
-// Telegram UI, not something a bot can build itself — there is no Bot API
-// call that returns "which chats does this user manage".
-export const addBotMenu = (type, botUsername) => {
-  const rights = "invite_users"; // minimal right needed for getChatMember checks
-  const param = type === "channel" ? "startchannel" : "startgroup";
-  const url = `https://t.me/${botUsername}?${param}=addadmin&admin=${rights}`;
-  return Markup.inlineKeyboard([
-    [Markup.button.url(`➕ Add to ${type === "channel" ? "Channel" : "Group"}`, url)],
-    [Markup.button.callback("✅ I've added it — Continue", `admin_yes_${type}`)],
-    [Markup.button.callback("⬅️ Back", "menu_promote")],
-  ]);
+export const promoteTypeReplyMenu = () =>
+  Markup.keyboard([
+    ["📢 Channel", "👥 Group"],
+    ["👁 Post", "🤖 Bot"],
+    ["⚡️ Premium boost (channel)", "❤️ Reactions"],
+    ["⚙️ Auto-task settings"],
+    ["📋 My Tasks", "⬅️ Back"],
+  ]).resize();
+
+// `request_chat` keyboard buttons are the only Bot API mechanism that can
+// show "pick one of your own channels/groups" — there's no API call that
+// lists which chats a given user administers. Telegram itself renders the
+// "Choose a Channel/Group" screen (with the admin-rights requirement and a
+// "Create a New Channel for This" option) and, once the user picks or
+// creates one, both (a) grants the bot the requested admin rights there and
+// (b) sends this bot a `chat_shared` service message with the chosen
+// chat's id. Both "I'm an admin" and "I'm not an admin" open the exact same
+// picker — whichever the user already has, this is how the bot actually
+// finds out the chat id and becomes an admin if it wasn't one already.
+function chatRequestButton(text, requestId, type) {
+  const rights = { can_invite_users: true };
+  const extra = { user_administrator_rights: rights, bot_administrator_rights: rights };
+  return type === "group"
+    ? Markup.button.groupRequest(text, requestId, extra)
+    : Markup.button.channelRequest(text, requestId, extra);
+}
+
+export const adminStatusReplyMenu = (type) =>
+  Markup.keyboard([
+    [chatRequestButton("🏠 I'm an admin", 1, type)],
+    [chatRequestButton("👁 I'm not an admin", 2, type)],
+    ["⬅️ Back"],
+  ]).resize();
+
+export const linkTypeMenu = () =>
+  Markup.keyboard([["➡️ Skip"], ["➕ Join-request link"], ["⬅️ Back"]]).resize();
+
+export const audienceMainMenu = () =>
+  Markup.keyboard([["🌐 Allow all"], ["🎯 Select audience"], ["⬅️ Back"]]).resize();
+
+export const audienceTierMenu = () =>
+  Markup.keyboard([["1️⃣ All users"], ["2️⃣ Telegram Premium only"], ["⬅️ Back"]]).resize();
+
+// Language codes shown for the audience-language filter. Add/remove entries
+// here to change what's offered — this list isn't tied to anything else.
+export const LANGUAGES = [
+  { code: "uk", label: "🇺🇦 Українська" },
+  { code: "ru", label: "🇷🇺 Русский" },
+  { code: "en", label: "🇬🇧 English" },
+  { code: "de", label: "🇩🇪 Deutsch" },
+  { code: "zh", label: "🇨🇳 中文" },
+  { code: "ar", label: "🇸🇦 العربية" },
+  { code: "fa", label: "🇮🇷 فارسی" },
+  { code: "es", label: "🇪🇸 Español" },
+  { code: "id", label: "🇮🇩 Bahasa Indonesia" },
+  { code: "pt", label: "🇧🇷 Português" },
+  { code: "hi", label: "🇮🇳 हिंदी" },
+  { code: "bn", label: "🇧🇩 বাংলা" },
+  { code: "uz", label: "🇺🇿 O'zbekcha" },
+  { code: "tr", label: "🇹🇷 Türkçe" },
+  { code: "kk", label: "🇰🇿 Қазақша" },
+  { code: "fr", label: "🇫🇷 Français" },
+];
+
+// Reply-keyboard buttons can't show a real checkbox, so a selected language
+// is prefixed with ✅ instead — strip that prefix back off when matching
+// incoming taps against LANGUAGES (see findLanguageByButtonText in bot.js).
+export const languageMenu = (selected = []) => {
+  const rows = [];
+  for (let i = 0; i < LANGUAGES.length; i += 2) {
+    rows.push(
+      LANGUAGES.slice(i, i + 2).map(
+        (l) => `${selected.includes(l.code) ? "✅ " : ""}${l.label}`
+      )
+    );
+  }
+  rows.push([`☑️ Continue (${selected.length} selected)`]);
+  rows.push(["⬅️ Back"]);
+  return Markup.keyboard(rows).resize();
 };
+
+export const countMenu = (maxForBalance) =>
+  Markup.keyboard([
+    [`${maxForBalance} (Maximum for your balance)`],
+    ["✏️ Custom amount"],
+    ["⬅️ Back"],
+  ]).resize();
+
+export const paymentMethodMenu = (gramCost, starsCost) =>
+  Markup.keyboard([
+    [`💲 ${gramCost} GRAM`],
+    [`⭐ ${starsCost} Telegram stars (-15%)`],
+    ["⬅️ Back"],
+  ]).resize();
+
+export const joinRequestConfirmMenu = () =>
+  Markup.keyboard([["✅ Yes, confirm"], ["⬅️ Back"]]).resize();
+
+export const publishConfirmMenu = () =>
+  Markup.keyboard([["✅ Publish Task"], ["⬅️ Back"]]).resize();

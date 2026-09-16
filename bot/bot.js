@@ -1,4 +1,5 @@
 import { Telegraf, Markup } from "telegraf";
+import { message } from "telegraf/filters";
 import { dbConnect } from "../lib/db.js";
 import User from "../models/User.js";
 import Task from "../models/Task.js";
@@ -6,17 +7,48 @@ import Transaction from "../models/Transaction.js";
 import {
   mainMenu,
   replyMainMenu,
-  promoteTypeMenu,
   earnTypeMenu,
   subscriberCountMenu,
   cabinetMenu,
   taskManageMenu,
   earnActionMenu,
+  promoteTypeReplyMenu,
   adminStatusReplyMenu,
-  addBotMenu,
+  linkTypeMenu,
+  audienceMainMenu,
+  audienceTierMenu,
+  languageMenu,
+  LANGUAGES,
+  countMenu,
+  paymentMethodMenu,
+  joinRequestConfirmMenu,
+  publishConfirmMenu,
 } from "./keyboards.js";
 
 const COMMISSION_PERCENT = Number(process.env.EARNED_COMMISSION_PERCENT || 10);
+// No official published GRAM<->Stars rate exists for this kind of bot —
+// this is a configurable approximation, not a real exchange rate. Adjust
+// via env var to whatever rate you actually want to offer.
+const GRAM_PER_STAR = Number(process.env.GRAM_PER_STAR || 2000);
+const STARS_DISCOUNT_PERCENT = 15;
+
+// Minimum/recommended price-per-completion, in GRAM coins. Selecting a
+// narrower audience (Premium-only, or one/more languages) raises the
+// minimum, matching the "audience filter adds +100 GRAM" messaging.
+const BASE_MIN_PRICE = 750;
+const PREMIUM_MIN_PRICE = 1400;
+const LANGUAGE_FILTER_SURCHARGE = 100;
+const RECOMMENDED_SURCHARGE = 150;
+
+function computeMinPrice(audienceMode, languages) {
+  let min = audienceMode === "premium_only" ? PREMIUM_MIN_PRICE : BASE_MIN_PRICE;
+  if (languages && languages.length > 0) min += LANGUAGE_FILTER_SURCHARGE;
+  return min;
+}
+
+function gramToStars(totalGram) {
+  return Math.max(1, Math.ceil((totalGram * (100 - STARS_DISCOUNT_PERCENT)) / 100 / GRAM_PER_STAR));
+}
 
 // Turn the "delete old menu / delete user's message" behavior on or off in
 // one place. Set back to true to re-enable auto-delete later.
@@ -24,16 +56,6 @@ const AUTO_DELETE_MESSAGES = false;
 
 // A single Telegraf instance is reused across warm serverless invocations.
 export const bot = new Telegraf(process.env.BOT_TOKEN);
-
-// Cached so we don't call getMe() on every single deep-link build.
-let cachedBotUsername = null;
-async function getBotUsername() {
-  if (!cachedBotUsername) {
-    const me = await bot.telegram.getMe();
-    cachedBotUsername = me.username;
-  }
-  return cachedBotUsername;
-}
 
 const TYPE_LABELS = {
   channel: "📢 Channel",
@@ -221,11 +243,8 @@ bot.action("menu_balance", async (ctx) => {
 
 bot.action("menu_promote", async (ctx) => {
   const user = await getOrCreateUser(ctx);
-  const total = user.donatedBalance + user.earnedBalance;
-  await ctx.editMessageText(
-    `📢 What do you want to promote?\n\n💰 Balance: ${total.toLocaleString()} GRAM`,
-    promoteTypeMenu()
-  );
+  await ctx.answerCbQuery();
+  await showPromoteTypeMenu(ctx, user);
 });
 
 bot.action("menu_earn", async (ctx) => {
@@ -237,130 +256,443 @@ bot.action("menu_cabinet", async (ctx) => {
 });
 
 // ---------- promote flow ----------
+// Full task-creation wizard: type -> admin/chat picker -> link type ->
+// audience -> price -> count -> payment method -> (join-request confirm) ->
+// publish. Every step here is a persistent reply keyboard, matching the
+// real app's style — see keyboards.js for the button layouts.
 
-// Shared "ask for price" step, used once we know (or the user has
-// confirmed) that the bot is an admin in the target chat.
-async function startPriceFlow(ctx, type) {
+// Types that need a target channel/group picked via Telegram's native
+// `request_chat` flow. "bot" targets another bot (not a chat), so it keeps
+// the simpler legacy price->count->@username flow further below instead.
+const CHAT_PICKER_TYPES = ["channel", "group", "views", "boost", "reactions"];
+
+async function showPromoteTypeMenu(ctx, user) {
+  await setSession(user, "promote_type_menu", {});
+  await renderWizardStep(ctx, user, "promote_type_menu");
+}
+
+// Pushes the CURRENT state onto a small stack before moving to `newState`,
+// so a later "⬅️ Back" tap can pop back to exactly where the user was.
+async function goForward(user, newState, dataPatch = {}) {
+  const backStack = [...(user.sessionData?.backStack || [])];
+  if (user.sessionState) backStack.push(user.sessionState);
+  await setSession(user, newState, { ...user.sessionData, ...dataPatch, backStack });
+}
+
+// Renders whichever wizard step `state` refers to, using data already on
+// the user's session. Shared by forward transitions and by "⬅️ Back".
+async function renderWizardStep(ctx, user, state) {
+  const d = user.sessionData || {};
+  switch (state) {
+    case "promote_type_menu": {
+      const total = user.donatedBalance + user.earnedBalance;
+      await ctx.reply(
+        `📢 What do you want to promote?\n\n💰 Balance: ${total.toLocaleString()} GRAM`,
+        promoteTypeReplyMenu()
+      );
+      return;
+    }
+    case "choosing_admin_status":
+      await ctx.reply(
+        "📢 Choose a chat or channel to promote (the bot must be an admin)",
+        adminStatusReplyMenu(d.type)
+      );
+      return;
+    case "choosing_link_type":
+      await ctx.reply(
+        `"${d.targetChatTitle || "Chat"}" added successfully.\n\n` +
+          `Choose the link type:\n` +
+          `🔗 Regular — members join instantly (tap "Skip").\n` +
+          `✅ With join requests — you approve everyone who joins.`,
+        linkTypeMenu()
+      );
+      return;
+    case "choosing_audience_main":
+      await ctx.reply(
+        `🎯 Task audience\n` +
+          `Current: ${
+            d.audienceMode === "premium_only" ? "Telegram Premium only" : "no restrictions"
+          }${d.languages?.length ? ` (${d.languages.join(", ")})` : ""}\n\n` +
+          `Choose who can access the task:\n` +
+          `💡 The audience filter adds +${LANGUAGE_FILTER_SURCHARGE} GRAM to the min. price per completion.`,
+        audienceMainMenu()
+      );
+      return;
+    case "choosing_audience_tier":
+      await ctx.reply(
+        `1️⃣ All users\n` +
+          `Broad reach among all PR GRAM users.\n` +
+          `💡 Minimum price: ${BASE_MIN_PRICE} GRAM/unit.\n\n` +
+          `2️⃣ Telegram Premium only\n` +
+          `Shown only to Telegram Premium users — a higher-quality audience.\n` +
+          `💡 Minimum price: ${PREMIUM_MIN_PRICE} GRAM/unit.`,
+        audienceTierMenu()
+      );
+      return;
+    case "choosing_audience_languages":
+      await ctx.reply(
+        `🈚 Choose one or more languages\n` +
+          `💡 The audience filter adds +${LANGUAGE_FILTER_SURCHARGE} GRAM to the min. price per completion.`,
+        languageMenu(d.languages || [])
+      );
+      return;
+    case "wizard_awaiting_price": {
+      const min = computeMinPrice(d.audienceMode, d.languages);
+      await ctx.reply(
+        `💲 Set the price for 1 subscription — this is the worker's reward.\n\n` +
+          `Minimum — ${min} GRAM\n` +
+          `💡 Recommended — ${min + RECOMMENDED_SURCHARGE} GRAM\n` +
+          `Completion speed depends on your price.`
+      );
+      return;
+    }
+    case "wizard_choosing_count": {
+      const total = user.donatedBalance + user.earnedBalance;
+      const maxForBalance = Math.max(1, Math.floor(total / d.price));
+      await ctx.reply(
+        `🧾 Enter the number of subscriptions or choose:\n` +
+          `💵 Subscription price — ${d.price} GRAM\n` +
+          `💰 Your balance — ${total.toLocaleString()} GRAM`,
+        countMenu(maxForBalance)
+      );
+      return;
+    }
+    case "wizard_awaiting_custom_count":
+      await ctx.reply("✏️ Send the exact number of subscriptions you want:");
+      return;
+    case "wizard_choosing_payment": {
+      const totalGram = d.price * d.count;
+      await ctx.reply(
+        "💳 Choose a payment method:",
+        paymentMethodMenu(totalGram, gramToStars(totalGram))
+      );
+      return;
+    }
+    case "wizard_confirming_join_request":
+      await ctx.reply(
+        `🔗 Create a join-request link?\n\n` +
+          `• Members join only after your approval.\n` +
+          `• The worker is paid as soon as they submit a join request.`,
+        joinRequestConfirmMenu()
+      );
+      return;
+    case "wizard_confirming_publish":
+      await ctx.reply(
+        `✅ Everything is ready to publish.\nPress "Publish Task" to post it.`,
+        publishConfirmMenu()
+      );
+      return;
+    default:
+      await showPromoteTypeMenu(ctx, user);
+  }
+}
+
+async function startChatPickerWizard(ctx, type) {
   const user = await getOrCreateUser(ctx);
-  await setSession(user, "awaiting_price", { type });
-  await ctx.editMessageText(
-    `${TYPE_LABELS[type]} selected.\n\n` +
+  if (user.sessionState !== "promote_type_menu") return;
+  await tryDeleteUserMessage(ctx);
+  await goForward(user, "choosing_admin_status", { type });
+  await renderWizardStep(ctx, user, "choosing_admin_status");
+}
+
+bot.hears("📢 Channel", (ctx) => startChatPickerWizard(ctx, "channel"));
+bot.hears("👥 Group", (ctx) => startChatPickerWizard(ctx, "group"));
+bot.hears("👁 Post", (ctx) => startChatPickerWizard(ctx, "views"));
+bot.hears("⚡️ Premium boost (channel)", (ctx) => startChatPickerWizard(ctx, "boost"));
+bot.hears("❤️ Reactions", (ctx) => startChatPickerWizard(ctx, "reactions"));
+
+// "Bot" promotion targets another bot, not a chat, so `request_chat` doesn't
+// apply — it keeps the simpler legacy price → count → @username flow that
+// already existed (see the "awaiting_price"/"awaiting_chat" branches below).
+bot.hears("🤖 Bot", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "promote_type_menu") return;
+  await tryDeleteUserMessage(ctx);
+  await setSession(user, "awaiting_price", { type: "bot" });
+  await ctx.reply(
+    `${TYPE_LABELS.bot} selected.\n\n` +
       `💡 Send the price (in coins) you want to pay per completion.\n` +
       `Tip: check the "Earn" section for current prices — higher prices get completed faster.`
   );
+});
+
+// `request_chat` buttons don't send their label as text when tapped — they
+// open Telegram's native chat picker directly. Once the user picks (or
+// creates) a chat there, Telegram both grants the bot the requested admin
+// rights in it AND sends this "chat_shared" service message with its id.
+// There is no Bot API call that lists a user's channels/groups itself, so
+// this native picker — requesting exactly the admin right the bot needs
+// (`can_invite_users`, used by isBotAdminIn/getChatMember) — is the only
+// way to offer a "pick from your channels" experience. Both admin-status
+// buttons use this same mechanism, since either way this is how the bot
+// actually learns which chat was chosen.
+bot.on(message("chat_shared"), async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "choosing_admin_status") return;
+  const chatId = ctx.message.chat_shared.chat_id;
+
+  let chatInfo;
+  try {
+    chatInfo = await bot.telegram.getChat(chatId);
+  } catch (e) {
+    await ctx.reply("Couldn't read that chat yet — please try adding it again.");
+    return;
+  }
+
+  const adminOk = await isBotAdminIn(chatId);
+  if (!adminOk) {
+    await ctx.reply(
+      "⚠️ I'm still not an admin there. Please try again and make sure to grant the requested permission."
+    );
+    return;
+  }
+
+  await goForward(user, "choosing_link_type", {
+    targetChatId: String(chatId),
+    targetChatTitle: chatInfo.title,
+    targetChatUsername: chatInfo.username,
+  });
+  await renderWizardStep(ctx, user, "choosing_link_type");
+});
+
+bot.hears("➡️ Skip", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "choosing_link_type") return;
+  await tryDeleteUserMessage(ctx);
+  await goForward(user, "choosing_audience_main", { linkType: "regular" });
+  await renderWizardStep(ctx, user, "choosing_audience_main");
+});
+
+bot.hears("➕ Join-request link", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "choosing_link_type") return;
+  await tryDeleteUserMessage(ctx);
+  await goForward(user, "choosing_audience_main", { linkType: "join_request" });
+  await renderWizardStep(ctx, user, "choosing_audience_main");
+});
+
+bot.hears("🌐 Allow all", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "choosing_audience_main") return;
+  await tryDeleteUserMessage(ctx);
+  await goForward(user, "wizard_awaiting_price", { audienceMode: "all", languages: [] });
+  await renderWizardStep(ctx, user, "wizard_awaiting_price");
+});
+
+bot.hears("🎯 Select audience", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "choosing_audience_main") return;
+  await tryDeleteUserMessage(ctx);
+  await goForward(user, "choosing_audience_tier", {});
+  await renderWizardStep(ctx, user, "choosing_audience_tier");
+});
+
+bot.hears("1️⃣ All users", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "choosing_audience_tier") return;
+  await tryDeleteUserMessage(ctx);
+  await goForward(user, "choosing_audience_languages", { audienceMode: "all" });
+  await renderWizardStep(ctx, user, "choosing_audience_languages");
+});
+
+bot.hears("2️⃣ Telegram Premium only", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "choosing_audience_tier") return;
+  await tryDeleteUserMessage(ctx);
+  await goForward(user, "choosing_audience_languages", { audienceMode: "premium_only" });
+  await renderWizardStep(ctx, user, "choosing_audience_languages");
+});
+
+// Language multi-select and the count/payment amount buttons all carry
+// dynamic numbers/labels in their text, so they're matched inside the
+// generic bot.on("text") handler below rather than via bot.hears(), which
+// only matches fixed strings.
+
+bot.hears("✅ Yes, confirm", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "wizard_confirming_join_request") return;
+  await tryDeleteUserMessage(ctx);
+  await goForward(user, "wizard_confirming_publish", {});
+  await renderWizardStep(ctx, user, "wizard_confirming_publish");
+});
+
+bot.hears("✅ Publish Task", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "wizard_confirming_publish") return;
+  await tryDeleteUserMessage(ctx);
+  await publishWizardTask(ctx, user);
+});
+
+// Moves from count -> payment method, after checking the balance can cover
+// at least this many completions at the chosen price.
+async function proceedToPayment(ctx, user, count) {
+  const totalGram = user.sessionData.price * count;
+  const available = user.donatedBalance + user.earnedBalance;
+  if (available < totalGram) {
+    await ctx.reply(
+      `❌ Insufficient balance for that many. Max you can afford: ` +
+        `${Math.max(1, Math.floor(available / user.sessionData.price))}.`
+    );
+    return;
+  }
+  await goForward(user, "wizard_choosing_payment", { count });
+  await renderWizardStep(ctx, user, "wizard_choosing_payment");
 }
 
-// Views/Bot/Boost/Reactions go straight to the price step, same as before.
-bot.action(/promote_(views|bot|boost|reactions)/, async (ctx) => {
-  await startPriceFlow(ctx, ctx.match[1]);
-});
+async function proceedAfterPaymentChoice(ctx, user, method) {
+  const nextState =
+    user.sessionData.linkType === "join_request"
+      ? "wizard_confirming_join_request"
+      : "wizard_confirming_publish";
+  await goForward(user, nextState, { paymentMethod: method });
+  await renderWizardStep(ctx, user, nextState);
+}
 
-// Channel/Group first ask whether the bot is already an admin there, since
-// that's a hard requirement (see isBotAdminIn) before a task can go live.
-// This step uses a persistent reply keyboard (not inline buttons), matching
-// the target UI, so it's handled by the bot.hears() handlers below rather
-// than bot.action().
-bot.action(/promote_(channel|group)/, async (ctx) => {
-  const type = ctx.match[1];
-  const user = await getOrCreateUser(ctx);
-  await ctx.answerCbQuery();
-  await setSession(user, "choosing_admin_status", { type });
-  await ctx.reply(
-    "📢 Choose a chat or channel to promote (the bot must be an admin)",
-    adminStatusReplyMenu()
-  );
-});
+// Creates the join-request invite link (if requested), deducts GRAM, and
+// creates the Task document. For Stars payment this is called from the
+// successful_payment handler instead, once Telegram confirms the charge.
+async function createWizardTask(ctx, user, paymentMethod) {
+  const d = user.sessionData;
+  const totalGram = d.price * d.count;
 
-// "🏠 I'm an admin" — the user says they administer the target chat
-// themselves, so show Telegram's own native add-to-channel/add-to-group
-// picker. Telegram lists every chat the user manages and lets them grant
-// admin rights to the bot in one tap — a bot cannot build this list itself,
-// there is no Bot API call for "which chats does this user administer".
-bot.hears("🏠 I'm an admin", async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  await tryDeleteUserMessage(ctx);
-  if (user.sessionState !== "choosing_admin_status") return;
-  const { type } = user.sessionData;
-  const botUsername = await getBotUsername();
-  await ctx.reply(
-    `➕ Tap the button below to add me as admin to your ${type}.\n\n` +
-      `Telegram will show you a list of the ${type}s you manage — pick one and ` +
-      `confirm the admin permissions. Then come back here and tap "I've added it — Continue".`,
-    addBotMenu(type, botUsername)
-  );
-});
+  let inviteLink;
+  if (d.linkType === "join_request") {
+    try {
+      inviteLink = await bot.telegram.createChatInviteLink(d.targetChatId, {
+        creates_join_request: true,
+      });
+    } catch (e) {
+      // Non-fatal — the task can still exist without a dedicated link.
+    }
+  }
 
-// "👁 I'm not an admin" — the user wants to promote a chat they don't
-// personally manage. The bot still needs to be added as admin somewhere,
-// so this opens the same native picker; if the target chat isn't theirs,
-// they'll need the actual admin of that chat to add the bot instead.
-bot.hears("👁 I'm not an admin", async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  await tryDeleteUserMessage(ctx);
-  if (user.sessionState !== "choosing_admin_status") return;
-  const { type } = user.sessionData;
-  const botUsername = await getBotUsername();
-  await ctx.reply(
-    `⚠️ Okay — I still need to be an admin in the ${type} to run the promotion.\n\n` +
-      `If it's your own ${type}, tap the button below — Telegram will show you a list of the ` +
-      `${type}s you manage, pick one and confirm the admin permissions.\n\n` +
-      `If it belongs to someone else, ask them to add me as an admin manually, then come back ` +
-      `and tap "I've added it — Continue".`,
-    addBotMenu(type, botUsername)
-  );
-});
+  let commission = 0;
+  if (paymentMethod === "gram") {
+    const spend = await spendForTask(user, totalGram);
+    if (!spend.ok) {
+      await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} GRAM.`);
+      return;
+    }
+    commission = spend.commission;
+  }
 
-// "⬅️ Back" from the admin-status reply keyboard — return to the promote
-// type menu and restore the normal persistent keyboard.
-bot.hears("⬅️ Back", async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  await tryDeleteUserMessage(ctx);
-  if (user.sessionState !== "choosing_admin_status") return;
+  await Task.create({
+    ownerTelegramId: user.telegramId,
+    type: d.type,
+    targetChatId: d.targetChatId,
+    targetChatTitle: d.targetChatTitle,
+    targetChatUsername: d.targetChatUsername,
+    linkType: d.linkType,
+    audienceMode: d.audienceMode,
+    languages: d.languages || [],
+    paymentMethod,
+    pricePerAction: d.price,
+    goalCount: d.count,
+  });
+
   await clearSession(user);
-  const total = user.donatedBalance + user.earnedBalance;
   await ctx.reply(
-    `📢 What do you want to promote?\n\n💰 Balance: ${total.toLocaleString()} GRAM`,
+    `✅ Task published!\n\n` +
+      `${TYPE_LABELS[d.type]} — ${d.targetChatTitle}\n` +
+      `Price: ${d.price} GRAM × ${d.count} = ${totalGram} GRAM` +
+      (commission ? ` (+${commission} commission)` : "") +
+      (inviteLink ? `\n🔗 Join-request link: ${inviteLink.invite_link}` : "") +
+      `\n\nTrack it under 👤 My Cabinet → My Tasks.`,
     replyMainMenu()
   );
-  await ctx.reply("👇 Pick a type:", promoteTypeMenu());
+}
+
+async function publishWizardTask(ctx, user) {
+  const d = user.sessionData;
+
+  if (d.paymentMethod === "stars") {
+    const totalGram = d.price * d.count;
+    const starsCost = gramToStars(totalGram);
+    try {
+      await ctx.replyWithInvoice({
+        title: `${TYPE_LABELS[d.type]} promotion task`,
+        description: `${d.count} completions at ${d.price} GRAM each for "${d.targetChatTitle}"`,
+        payload: "promote_task",
+        provider_token: "", // empty provider_token = pay with Telegram Stars
+        currency: "XTR",
+        prices: [{ label: "Task cost", amount: starsCost }],
+      });
+    } catch (e) {
+      await ctx.reply(
+        "Couldn't create the Stars invoice. Please try again, or go back and pay with GRAM instead."
+      );
+    }
+    return; // the task itself is created once successful_payment comes in
+  }
+
+  await createWizardTask(ctx, user, "gram");
+}
+
+// Telegram requires the bot to answer every pre_checkout_query within 10s.
+bot.on("pre_checkout_query", async (ctx) => {
+  await ctx.answerPreCheckoutQuery(true);
 });
 
-// "✅ I've added it — Continue" (inline button shown alongside the
-// "➕ Add to Channel/Group" link) — proceed to price step.
-bot.action(/admin_yes_(channel|group)/, async (ctx) => {
-  await ctx.answerCbQuery();
-  await startPriceFlow(ctx, ctx.match[1]);
+// Fires once a Telegram Stars payment actually completes. The task's
+// details are still sitting in the user's session (we never cleared it
+// while waiting for payment), so it's built from there.
+bot.on(message("successful_payment"), async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (!user.sessionData?.type || !user.sessionData?.targetChatId) {
+    await ctx.reply(
+      "✅ Payment received, but I couldn't find the pending task details — please contact support."
+    );
+    return;
+  }
+  await createWizardTask(ctx, user, "stars");
 });
 
-bot.action("promote_auto_settings", async (ctx) => {
+bot.hears("⚙️ Auto-task settings", async (ctx) => {
   // Placeholder: auto-task settings (automatically recreate a task with the
   // same parameters once it completes) isn't wired up to real logic yet.
   // A full version would add fields like `autoRepeat`/`autoRepeatCount` on
   // the Task model and a scheduled job (e.g. a Vercel Cron route) that
   // recreates completed tasks for users who enabled this.
-  await ctx.answerCbQuery();
-  await ctx.editMessageText(
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "promote_type_menu") return;
+  await tryDeleteUserMessage(ctx);
+  await ctx.reply(
     "⚙️ Auto-task settings\n\n" +
       "This feature (automatically recreating a task once it completes) isn't " +
-      "built yet in this version — let me know if you want it added.",
-    promoteTypeMenu()
+      "built yet in this version — let me know if you want it added."
   );
 });
 
-bot.action("cabinet_tasks", async (ctx) => {
-  await dbConnect();
+// Single generic "⬅️ Back" for the whole wizard: pops the tracked back
+// stack and re-renders whatever step that was. With nothing tracked (top of
+// the wizard, or not in it at all), it returns to the persistent main menu.
+bot.hears("⬅️ Back", async (ctx) => {
   const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
+  const stack = [...(user.sessionData?.backStack || [])];
+  if (!stack.length) {
+    await clearSession(user);
+    await ctx.reply("🏠 Main Menu", replyMainMenu());
+    return;
+  }
+  const prevState = stack.pop();
+  await setSession(user, prevState, { ...user.sessionData, backStack: stack });
+  await renderWizardStep(ctx, user, prevState);
+});
+
+async function showMyTasks(ctx, user) {
+  await dbConnect();
   const tasks = await Task.find({
     ownerTelegramId: user.telegramId,
     status: { $ne: "deleted" },
   }).sort({ createdAt: -1 });
 
   if (!tasks.length) {
-    await ctx.editMessageText("You have no tasks yet.", cabinetMenu());
+    await ctx.reply("You have no tasks yet.", cabinetMenu());
     return;
   }
 
-  await ctx.editMessageText(`📋 You have ${tasks.length} task(s):`);
+  await ctx.reply(`📋 You have ${tasks.length} task(s):`);
   for (const t of tasks) {
     await ctx.reply(
       `${TYPE_LABELS[t.type]} — ${t.targetChatTitle || t.targetChatId}\n` +
@@ -369,6 +701,19 @@ bot.action("cabinet_tasks", async (ctx) => {
       taskManageMenu(t._id.toString(), t.status)
     );
   }
+}
+
+bot.hears("📋 My Tasks", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "promote_type_menu") return;
+  await tryDeleteUserMessage(ctx);
+  await showMyTasks(ctx, user);
+});
+
+bot.action("cabinet_tasks", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  await showMyTasks(ctx, user);
 });
 
 bot.action(/task_pause_(.+)/, async (ctx) => {
@@ -489,15 +834,8 @@ bot.action(/verify_(.+)/, async (ctx) => {
 
 bot.hears("📢 Promote", async (ctx) => {
   const user = await getOrCreateUser(ctx);
-  await clearSession(user);
   await tryDeleteUserMessage(ctx);
-  const total = user.donatedBalance + user.earnedBalance;
-  await sendClean(
-    ctx,
-    user,
-    `📢 What do you want to promote?\n\n💰 Balance: ${total.toLocaleString()} GRAM`,
-    promoteTypeMenu()
-  );
+  await showPromoteTypeMenu(ctx, user);
 });
 
 bot.hears("💰 Earnings", async (ctx) => {
@@ -647,6 +985,88 @@ bot.on("text", async (ctx) => {
     return;
   }
 
+  // ---- new promote-wizard states (channel/group/views/boost/reactions) ----
+
+  if (state === "choosing_audience_languages") {
+    if (text.startsWith("☑️ Continue")) {
+      await goForward(user, "wizard_awaiting_price", {});
+      await renderWizardStep(ctx, user, "wizard_awaiting_price");
+      return;
+    }
+    const clean = text.replace(/^✅\s*/, "");
+    const lang = LANGUAGES.find((l) => l.label === clean);
+    if (!lang) {
+      await ctx.reply("Tap a language to toggle it, or tap Continue.");
+      return;
+    }
+    const current = user.sessionData.languages || [];
+    const languages = current.includes(lang.code)
+      ? current.filter((c) => c !== lang.code)
+      : [...current, lang.code];
+    await setSession(user, "choosing_audience_languages", { ...user.sessionData, languages });
+    await renderWizardStep(ctx, user, "choosing_audience_languages");
+    return;
+  }
+
+  if (state === "wizard_awaiting_price") {
+    const price = Number(text);
+    const min = computeMinPrice(user.sessionData.audienceMode, user.sessionData.languages);
+    if (!Number.isFinite(price) || price <= 0) {
+      await ctx.reply("Please send a valid positive number for the price.");
+      return;
+    }
+    if (price < min) {
+      await ctx.reply(`⚠️ Price too low. Minimum — ${min} GRAM per subscriber.`);
+      await renderWizardStep(ctx, user, "wizard_awaiting_price");
+      return;
+    }
+    await goForward(user, "wizard_choosing_count", { price });
+    await renderWizardStep(ctx, user, "wizard_choosing_count");
+    return;
+  }
+
+  if (state === "wizard_choosing_count") {
+    const total = user.donatedBalance + user.earnedBalance;
+    const maxForBalance = Math.max(1, Math.floor(total / user.sessionData.price));
+    if (text === "✏️ Custom amount") {
+      await goForward(user, "wizard_awaiting_custom_count", {});
+      await renderWizardStep(ctx, user, "wizard_awaiting_custom_count");
+      return;
+    }
+    const tappedMax = parseInt(text, 10);
+    if (text.endsWith("(Maximum for your balance)") && tappedMax === maxForBalance) {
+      await proceedToPayment(ctx, user, maxForBalance);
+      return;
+    }
+    await ctx.reply('Tap a button below, or use "✏️ Custom amount" to type a number.');
+    return;
+  }
+
+  if (state === "wizard_awaiting_custom_count") {
+    const count = parseInt(text, 10);
+    if (!Number.isFinite(count) || count <= 0) {
+      await ctx.reply("Please send a valid positive whole number.");
+      return;
+    }
+    await proceedToPayment(ctx, user, count);
+    return;
+  }
+
+  if (state === "wizard_choosing_payment") {
+    const totalGram = user.sessionData.price * user.sessionData.count;
+    const starsCost = gramToStars(totalGram);
+    if (text === `💲 ${totalGram} GRAM`) {
+      await proceedAfterPaymentChoice(ctx, user, "gram");
+      return;
+    }
+    if (text === `⭐ ${starsCost} Telegram stars (-${STARS_DISCOUNT_PERCENT}%)`) {
+      await proceedAfterPaymentChoice(ctx, user, "stars");
+      return;
+    }
+    await ctx.reply("Please tap one of the payment method buttons below.");
+    return;
+  }
+
   // No active flow — show main menu as a fallback.
   await ctx.reply("Use the menu below 👇", mainMenu());
 });
@@ -704,29 +1124,6 @@ async function handleChatInput(ctx, user, message) {
     return;
   }
 
-  let chatInfo;
-  try {
-    chatInfo = await bot.telegram.getChat(chatId);
-  } catch (e) {
-    await ctx.reply("Couldn't read that chat. Please try again.");
-    return;
-  }
-
-  const { type, price, count } = user.sessionData;
-  await createTask(ctx, user, {
-    type,
-    price,
-    count,
-    chatId: String(chatId),
-    chatTitle: chatInfo.title,
-    chatUsername: chatInfo.username,
-  });
-}
-
-// Shared task-creation step used once the target chat is known (from a
-// forwarded message or @username). Confirms the bot is actually an admin
-// there before spending any coins.
-async function createTask(ctx, user, { type, price, count, chatId, chatTitle, chatUsername }) {
   const adminOk = await isBotAdminIn(chatId);
   if (!adminOk) {
     await ctx.reply(
@@ -736,7 +1133,16 @@ async function createTask(ctx, user, { type, price, count, chatId, chatTitle, ch
     return;
   }
 
+  let chatInfo;
+  try {
+    chatInfo = await bot.telegram.getChat(chatId);
+  } catch (e) {
+    await ctx.reply("Couldn't read that chat. Please try again.");
+    return;
+  }
+
   await dbConnect();
+  const { type, price, count } = user.sessionData;
   const spend = await spendForTask(user, price * count);
   if (!spend.ok) {
     await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} coins.`);
@@ -747,8 +1153,8 @@ async function createTask(ctx, user, { type, price, count, chatId, chatTitle, ch
     ownerTelegramId: user.telegramId,
     type,
     targetChatId: String(chatId),
-    targetChatTitle: chatTitle,
-    targetChatUsername: chatUsername,
+    targetChatTitle: chatInfo.title,
+    targetChatUsername: chatInfo.username,
     pricePerAction: price,
     goalCount: count,
   });
@@ -756,7 +1162,7 @@ async function createTask(ctx, user, { type, price, count, chatId, chatTitle, ch
   await clearSession(user);
   await ctx.reply(
     `✅ Task created!\n\n` +
-      `${TYPE_LABELS[type]} — ${chatTitle || chatUsername}\n` +
+      `${TYPE_LABELS[type]} — ${chatInfo.title || chatUsername}\n` +
       `Price: ${price} coins × ${count} = ${price * count} coins` +
       (spend.commission ? ` (+${spend.commission} commission)` : "") +
       `\n\nTrack it under 🗂 My Cabinet → My Tasks.`,
