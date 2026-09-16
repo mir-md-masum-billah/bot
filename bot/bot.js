@@ -3,7 +3,6 @@ import { dbConnect } from "../lib/db.js";
 import User from "../models/User.js";
 import Task from "../models/Task.js";
 import Transaction from "../models/Transaction.js";
-import AdminChat from "../models/AdminChat.js";
 import {
   mainMenu,
   replyMainMenu,
@@ -13,9 +12,8 @@ import {
   cabinetMenu,
   taskManageMenu,
   earnActionMenu,
+  adminStatusReplyMenu,
   addBotMenu,
-  adminChatListMenu,
-  adminChatDetailMenu,
 } from "./keyboards.js";
 
 const COMMISSION_PERCENT = Number(process.env.EARNED_COMMISSION_PERCENT || 10);
@@ -202,66 +200,6 @@ bot.command("balance", async (ctx) => {
   );
 });
 
-// ---------- admin-status auto-detection ----------
-
-// Fires whenever the bot's own membership status changes in any chat —
-// including the moment someone grants it admin rights via the
-// `startchannel`/`startgroup` deep link. `ctx.myChatMember.from` is the
-// person who performed the change, so we can attribute it without any
-// manual "I've added it" confirmation or session correlation.
-bot.on("my_chat_member", async (ctx) => {
-  const update = ctx.myChatMember;
-  const { chat, from, new_chat_member: newMember, old_chat_member: oldMember } = update;
-
-  const wasAdmin = ["administrator", "creator"].includes(oldMember.status);
-  const isAdmin = ["administrator", "creator"].includes(newMember.status);
-  const chatType = chat.type === "channel" ? "channel" : "group"; // group/supergroup → group
-
-  await dbConnect();
-
-  if (isAdmin && !wasAdmin) {
-    const permissions = [
-      newMember.can_post_messages && "post_messages",
-      newMember.can_edit_messages && "edit_messages",
-      newMember.can_delete_messages && "delete_messages",
-      newMember.can_invite_users && "invite_users",
-      newMember.can_manage_chat && "manage_chat",
-    ].filter(Boolean);
-
-    await AdminChat.findOneAndUpdate(
-      { ownerTelegramId: from.id, chatId: String(chat.id) },
-      {
-        ownerTelegramId: from.id,
-        chatId: String(chat.id),
-        chatType,
-        chatTitle: chat.title,
-        chatUsername: chat.username,
-        permissions,
-        status: "active",
-        addedAt: new Date(),
-      },
-      { upsert: true, new: true }
-    );
-
-    try {
-      await bot.telegram.sendMessage(
-        from.id,
-        `✅ Added as admin to ${TYPE_LABELS[chatType]} "${chat.title}".\n\n` +
-          `It's now saved under "✅ Already Added". Open 📢 Promote → ${TYPE_LABELS[chatType]} ` +
-          `to set a price and create a task for it.`
-      );
-    } catch (e) {
-      // User may not have started a private chat with the bot yet — ignore.
-    }
-  } else if (wasAdmin && !isAdmin) {
-    // Demoted/removed — stop offering it under "Already Added".
-    await AdminChat.updateOne(
-      { ownerTelegramId: from.id, chatId: String(chat.id) },
-      { status: "removed" }
-    );
-  }
-});
-
 // ---------- navigation ----------
 
 bot.action("menu_main", async (ctx) => {
@@ -317,105 +255,80 @@ bot.action(/promote_(views|bot|boost|reactions)/, async (ctx) => {
   await startPriceFlow(ctx, ctx.match[1]);
 });
 
-// Channel/Group: show a single "Add bot to Channel/Group" button (deep
-// link, type-specific under the hood) plus "Already Added". No more
-// "I'm an admin / I'm not an admin" choice, and no manual "I've added it"
-// confirmation — admin status is detected automatically (see the
-// `my_chat_member` handler below) the moment the user grants it.
+// Channel/Group first ask whether the bot is already an admin there, since
+// that's a hard requirement (see isBotAdminIn) before a task can go live.
+// This step uses a persistent reply keyboard (not inline buttons), matching
+// the target UI, so it's handled by the bot.hears() handlers below rather
+// than bot.action().
 bot.action(/promote_(channel|group)/, async (ctx) => {
   const type = ctx.match[1];
   const user = await getOrCreateUser(ctx);
   await ctx.answerCbQuery();
   await setSession(user, "choosing_admin_status", { type });
-  const botUsername = await getBotUsername();
-  await ctx.editMessageText(
+  await ctx.reply(
+    "📢 Choose a chat or channel to promote (the bot must be an admin)",
+    adminStatusReplyMenu()
+  );
+});
+
+// "🏠 I'm an admin" — proceed straight to the price step.
+bot.hears("🏠 I'm an admin", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
+  if (user.sessionState !== "choosing_admin_status") return;
+  const { type } = user.sessionData;
+  await setSession(user, "awaiting_price", { type });
+  await ctx.reply(
     `${TYPE_LABELS[type]} selected.\n\n` +
-      `➕ Tap below to add me as an admin to the ${type} you want to promote, ` +
-      `or pick one you've already added me to.`,
+      `💡 Send the price (in coins) you want to pay per completion.\n` +
+      `Tip: check the "Earn" section for current prices — higher prices get completed faster.`,
+    replyMainMenu()
+  );
+});
+
+// "👁 I'm not an admin" — show a button that opens Telegram's own
+// add-to-channel/add-to-group picker. Telegram (not this bot) lists every
+// channel/group the user administers and lets them grant admin rights to
+// the bot in one tap — a bot has no API to fetch that list itself, so this
+// native picker is the only way to offer a "choose from your channels" flow.
+bot.hears("👁 I'm not an admin", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await tryDeleteUserMessage(ctx);
+  if (user.sessionState !== "choosing_admin_status") return;
+  const { type } = user.sessionData;
+  await ctx.reply(
+    `⚠️ Okay — let's add me as an admin to your ${type} first.`,
+    replyMainMenu()
+  );
+  const botUsername = await getBotUsername();
+  await ctx.reply(
+    `➕ Tap the button below to add me as an admin to your ${type}.\n\n` +
+      `Telegram will show you a list of the ${type}s you manage — pick one and ` +
+      `confirm the admin permissions. Then come back here and tap "I've added it".`,
     addBotMenu(type, botUsername)
   );
 });
 
-// "✅ Already Added" — list every chat this user has already made the bot
-// an admin of (from AdminChat, populated by the my_chat_member handler).
-bot.action("menu_already_added", async (ctx) => {
-  await dbConnect();
+// "⬅️ Back" from the admin-status reply keyboard — return to the promote
+// type menu and restore the normal persistent keyboard.
+bot.hears("⬅️ Back", async (ctx) => {
   const user = await getOrCreateUser(ctx);
-  await ctx.answerCbQuery();
-  const chats = await AdminChat.find({
-    ownerTelegramId: user.telegramId,
-    status: "active",
-  }).sort({ createdAt: -1 });
-
-  if (!chats.length) {
-    await ctx.editMessageText(
-      "You haven't added me as admin to any channel/group yet.",
-      addBotMenu(user.sessionData?.type || "channel", await getBotUsername())
-    );
-    return;
-  }
-
-  await ctx.editMessageText("📋 Chats you've added me to:", adminChatListMenu(chats));
-});
-
-// Tapping a chat from the "Already Added" list — show what task(s) exist
-// for it and their completion progress.
-bot.action(/admchat_(.+)/, async (ctx) => {
-  await dbConnect();
-  await ctx.answerCbQuery();
-  const adminChat = await AdminChat.findById(ctx.match[1]);
-  if (!adminChat) {
-    await ctx.editMessageText("That chat isn't tracked anymore.");
-    return;
-  }
-
-  const tasks = await Task.find({
-    targetChatId: adminChat.chatId,
-    status: { $ne: "deleted" },
-  }).sort({ createdAt: -1 });
-
-  let text =
-    `${adminChat.chatType === "channel" ? "📢" : "👥"} ${adminChat.chatTitle || adminChat.chatId}\n` +
-    `Added as admin: ${adminChat.addedAt.toLocaleDateString()}\n` +
-    `Permissions: ${adminChat.permissions.join(", ") || "—"}\n\n`;
-
-  if (!tasks.length) {
-    text += "No tasks created for this chat yet.";
-  } else {
-    text += `📋 ${tasks.length} task(s):\n\n`;
-    for (const t of tasks) {
-      text +=
-        `${TYPE_LABELS[t.type]} — ${t.pricePerAction} coins each\n` +
-        `Progress: ${t.completedCount}/${t.goalCount} completed | Status: ${t.status}\n\n`;
-    }
-  }
-
-  await ctx.editMessageText(text, adminChatDetailMenu(adminChat._id.toString()));
-});
-
-// "➕ New task for this chat" — skip the forward-a-message / send-@username
-// step entirely, since we already know this chat from AdminChat.
-bot.action(/newtask_(.+)/, async (ctx) => {
-  await dbConnect();
-  const user = await getOrCreateUser(ctx);
-  await ctx.answerCbQuery();
-  const adminChat = await AdminChat.findById(ctx.match[1]);
-  if (!adminChat || adminChat.status !== "active") {
-    await ctx.editMessageText("That chat isn't tracked anymore.");
-    return;
-  }
-  await setSession(user, "awaiting_price", {
-    type: adminChat.chatType,
-    prefilledChat: {
-      chatId: adminChat.chatId,
-      chatTitle: adminChat.chatTitle,
-      chatUsername: adminChat.chatUsername,
-    },
-  });
-  await ctx.editMessageText(
-    `${TYPE_LABELS[adminChat.chatType]} — ${adminChat.chatTitle} selected.\n\n` +
-      `💡 Send the price (in coins) you want to pay per completion.`
+  await tryDeleteUserMessage(ctx);
+  if (user.sessionState !== "choosing_admin_status") return;
+  await clearSession(user);
+  const total = user.donatedBalance + user.earnedBalance;
+  await ctx.reply(
+    `📢 What do you want to promote?\n\n💰 Balance: ${total.toLocaleString()} GRAM`,
+    replyMainMenu()
   );
+  await ctx.reply("👇 Pick a type:", promoteTypeMenu());
+});
+
+// "✅ I've added it — Continue" (inline button shown alongside the
+// "➕ Add to Channel/Group" link) — proceed to price step.
+bot.action(/admin_yes_(channel|group)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await startPriceFlow(ctx, ctx.match[1]);
 });
 
 bot.action("promote_auto_settings", async (ctx) => {
@@ -751,7 +664,7 @@ bot.action(/count_(\d+)/, async (ctx) => {
 });
 
 async function finalizeCount(ctx, user, count) {
-  const { type, price, prefilledChat } = user.sessionData;
+  const { type, price } = user.sessionData;
   const totalCost = price * count;
   const available = user.donatedBalance + user.earnedBalance;
 
@@ -762,20 +675,6 @@ async function finalizeCount(ctx, user, count) {
         `(plus commission if paid from earned coins). Your balance: ${available}.`,
       mainMenu()
     );
-    return;
-  }
-
-  // Chat already known (came from "Already Added" → New task) — create the
-  // task immediately, no need to ask the user to forward/identify it.
-  if (prefilledChat) {
-    await createTask(ctx, user, {
-      type,
-      price,
-      count,
-      chatId: prefilledChat.chatId,
-      chatTitle: prefilledChat.chatTitle,
-      chatUsername: prefilledChat.chatUsername,
-    });
     return;
   }
 
@@ -821,21 +720,8 @@ async function handleChatInput(ctx, user, message) {
     return;
   }
 
-  const { type, price, count } = user.sessionData;
-  await createTask(ctx, user, {
-    type,
-    price,
-    count,
-    chatId,
-    chatTitle: chatInfo.title,
-    chatUsername: chatInfo.username,
-  });
-}
-
-// Shared task-creation step used both by the classic forward/@username flow
-// and the "Already Added" → New task shortcut.
-async function createTask(ctx, user, { type, price, count, chatId, chatTitle, chatUsername }) {
   await dbConnect();
+  const { type, price, count } = user.sessionData;
   const spend = await spendForTask(user, price * count);
   if (!spend.ok) {
     await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} coins.`);
@@ -846,8 +732,8 @@ async function createTask(ctx, user, { type, price, count, chatId, chatTitle, ch
     ownerTelegramId: user.telegramId,
     type,
     targetChatId: String(chatId),
-    targetChatTitle: chatTitle,
-    targetChatUsername: chatUsername,
+    targetChatTitle: chatInfo.title,
+    targetChatUsername: chatInfo.username,
     pricePerAction: price,
     goalCount: count,
   });
@@ -855,7 +741,7 @@ async function createTask(ctx, user, { type, price, count, chatId, chatTitle, ch
   await clearSession(user);
   await ctx.reply(
     `✅ Task created!\n\n` +
-      `${TYPE_LABELS[type]} — ${chatTitle || chatUsername}\n` +
+      `${TYPE_LABELS[type]} — ${chatInfo.title || chatUsername}\n` +
       `Price: ${price} coins × ${count} = ${price * count} coins` +
       (spend.commission ? ` (+${spend.commission} commission)` : "") +
       `\n\nTrack it under 🗂 My Cabinet → My Tasks.`,

@@ -85,42 +85,24 @@ export const earnActionMenu = (taskId) =>
     [Markup.button.callback("⏭ Skip", "earn_sub")],
   ]);
 
+// Ask whether the bot is already an admin in the channel/group the user
+// wants to promote. Persistent reply keyboard (not inline) to match the
+// app's native full-width button style for this step.
+export const adminStatusReplyMenu = () =>
+  Markup.keyboard([["🏠 I'm an admin"], ["👁 I'm not an admin"], ["⬅️ Back"]]).resize();
+
 // Telegram's `startchannel` / `startgroup` deep links open Telegram's own
 // native picker of every channel/group the user administers, and let them
 // grant the requested admin rights to the bot in one tap. This is Telegram
 // UI, not something a bot can build itself — there is no Bot API call that
 // returns "which chats does this user manage".
-//
-// Single-button replacement for the old "I'm an admin / I'm not an admin"
-// choice: one "Add bot" button (deep link, type-specific under the hood)
-// plus "Already Added" to browse chats already set up.
 export const addBotMenu = (type, botUsername) => {
-  const rights = "post_messages+edit_messages+delete_messages+invite_users+manage_chat";
+  const rights = "invite_users"; // minimal right needed for getChatMember checks
   const param = type === "channel" ? "startchannel" : "startgroup";
-  const url = `https://t.me/${botUsername}?${param}&admin=${rights}`;
+  const url = `https://t.me/${botUsername}?${param}=addadmin&admin=${rights}`;
   return Markup.inlineKeyboard([
-    [Markup.button.url("➕ ADD BOT TO CHANNEL/GROUP", url)],
-    [Markup.button.callback("✅ Already Added", "menu_already_added")],
+    [Markup.button.url(`➕ Add to ${type === "channel" ? "Channel" : "Group"}`, url)],
+    [Markup.button.callback("✅ I've added it — Continue", `admin_yes_${type}`)],
     [Markup.button.callback("⬅️ Back", "menu_promote")],
   ]);
 };
-
-// "✅ Already Added" → list of chats (for this user) where the bot is
-// currently an admin, one button per chat.
-export const adminChatListMenu = (chats) =>
-  Markup.inlineKeyboard([
-    ...chats.map((c) => [
-      Markup.button.callback(
-        `${c.chatType === "channel" ? "📢" : "👥"} ${c.chatTitle || c.chatId}`,
-        `admchat_${c._id}`
-      ),
-    ]),
-    [Markup.button.callback("⬅️ Back", "menu_promote")],
-  ]);
-
-// Detail view for a single already-added chat.
-export const adminChatDetailMenu = (adminChatId) =>
-  Markup.inlineKeyboard([
-    [Markup.button.callback("➕ New task for this chat", `newtask_${adminChatId}`)],
-    [Markup.button.callback("⬅️ Back to list", "menu_already_added")],
-  ]);
