@@ -13,9 +13,26 @@ if (!BOT_TOKEN || !PUBLIC_URL || !WEBHOOK_SECRET) {
 }
 
 const webhookUrl = `${PUBLIC_URL}/api/webhook/${WEBHOOK_SECRET}`;
-const apiUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${encodeURIComponent(
-  webhookUrl
-)}`;
+
+// Telegram's default update set (used when allowed_updates is omitted)
+// excludes "chat_member" — and "chat_join_request" only arrives once it's
+// been requested at least once. Both are required here: chat_member drives
+// the 7-day-minimum-stay clawback, and chat_join_request drives auto-approval
+// of join-request links. Everything the bot already relied on (messages,
+// button taps, payments, the request_chat/chat_shared picker, the
+// verification WebApp) is covered by the other entries below.
+const allowedUpdates = [
+  "message",
+  "edited_message",
+  "callback_query",
+  "pre_checkout_query",
+  "chat_join_request",
+  "chat_member",
+  "my_chat_member",
+];
+const apiUrl =
+  `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}` +
+  `&allowed_updates=${encodeURIComponent(JSON.stringify(allowedUpdates))}`;
 
 https
   .get(apiUrl, (res) => {

@@ -109,6 +109,43 @@ async function creditEarned(user, amount, note, relatedTaskId) {
   });
 }
 
+// Claws back up to `amount` GRAM from a worker's earned balance (never goes
+// below 0 even if they've already spent it elsewhere) and logs it. Returns
+// how much was actually deducted, so the owner is only ever credited what
+// was actually recovered.
+async function clawbackEarned(user, amount, note, relatedTaskId) {
+  const deducted = Math.min(user.earnedBalance, amount);
+  user.earnedBalance -= deducted;
+  await user.save();
+  if (deducted > 0) {
+    await Transaction.create({
+      telegramId: user.telegramId,
+      type: "admin_adjust",
+      amount: -deducted,
+      relatedTaskId,
+      note,
+    });
+  }
+  return deducted;
+}
+
+// Returns reclaimed GRAM to the task owner's donated balance (same pool
+// used for task-deletion refunds), so it costs no commission to reuse.
+async function creditOwnerReclaimed(ownerTelegramId, amount, relatedTaskId) {
+  if (amount <= 0) return;
+  const owner = await User.findOne({ telegramId: ownerTelegramId });
+  if (!owner) return;
+  owner.donatedBalance += amount;
+  await owner.save();
+  await Transaction.create({
+    telegramId: owner.telegramId,
+    type: "refund",
+    amount,
+    relatedTaskId,
+    note: `Subscriber left before the ${MIN_STAY_DAYS}-day minimum — GRAM reclaimed`,
+  });
+}
+
 // Spend: donated balance first, then earned balance (commission applies
 // only to the portion paid from earned/non-donated coins).
 async function spendForTask(user, totalCost) {
@@ -785,7 +822,15 @@ bot.action(/task_delete_(.+)/, async (ctx) => {
 const EARN_PAGE_SIZE = 10;
 // After this many successful Checks since the last verification, the user
 // must pass the human-verification puzzle again before another Check counts.
-const ANTI_BOT_CHECK_INTERVAL = 15;
+// The very first completion a user ever makes always forces one too (see
+// the "totalTasksCompleted === 1" check in the verify_ handler below).
+const ANTI_BOT_CHECK_INTERVAL = 10;
+
+// A worker who completed a channel/group subscribe task must stay
+// subscribed at least this many days, or the GRAM they earned for it is
+// clawed back and returned to the task owner (see the chat_member handler).
+const MIN_STAY_DAYS = 7;
+const MIN_STAY_MS = MIN_STAY_DAYS * 24 * 60 * 60 * 1000;
 
 const EARN_TYPE_MAP = { sub: ["channel", "group"], views: ["views"], bot: ["bot"] };
 
@@ -909,6 +954,9 @@ bot.action(/verify_(.+)/, async (ctx) => {
 
   task.completedCount += 1;
   task.completedBy.push(user.telegramId);
+  // Recorded so the chat_member handler can later check whether this user
+  // stayed subscribed at least MIN_STAY_DAYS before clawing the reward back.
+  task.completions.push({ telegramId: user.telegramId, completedAt: new Date() });
   if (task.completedCount >= task.goalCount) task.status = "completed";
   await task.save();
 
@@ -920,11 +968,20 @@ bot.action(/verify_(.+)/, async (ctx) => {
   await ctx.reply(
     `✅ Task №${taskNumber.toLocaleString()} completed\n\n` +
       `💵 You received +${task.pricePerAction.toLocaleString()} GRAM\n` +
-      `💰 Balance: ${balance.toLocaleString()} GRAM`
+      `💰 Balance: ${balance.toLocaleString()} GRAM\n\n` +
+      (task.type === "channel" || task.type === "group"
+        ? `ℹ️ Stay subscribed at least ${MIN_STAY_DAYS} days — leaving early gets this reward deducted again.`
+        : "")
   );
 
+  // Refresh the earn list in place: remove the just-completed task and
+  // re-sort so the highest-paying remaining task is back on top.
+  await refreshEarnListInPlace(ctx, task, user.telegramId);
+
+  user.totalTasksCompleted += 1;
   user.tasksSinceVerification += 1;
-  if (user.tasksSinceVerification >= ANTI_BOT_CHECK_INTERVAL) {
+  const isFirstEverCompletion = user.totalTasksCompleted === 1;
+  if (isFirstEverCompletion || user.tasksSinceVerification >= ANTI_BOT_CHECK_INTERVAL) {
     user.tasksSinceVerification = 0;
     user.isVerified = false;
     await user.save();
@@ -933,6 +990,57 @@ bot.action(/verify_(.+)/, async (ctx) => {
     await user.save();
   }
 });
+
+// After a Check succeeds, re-renders the same earn-list message (same
+// category/page it was tapped from) with the just-completed task removed
+// and the remaining ones freshly sorted highest-price-first.
+async function refreshEarnListInPlace(ctx, task, completingTelegramId) {
+  try {
+    await dbConnect();
+    const category = task.type === "views" ? "views" : task.type === "bot" ? "bot" : "sub";
+
+    // The current page is always the 3rd button of the pagination row
+    // (["1", "<", `${page}`, ">", `${totalPages}`]) — see earnTaskListMenu.
+    let page = 1;
+    const rows = ctx.callbackQuery?.message?.reply_markup?.inline_keyboard || [];
+    for (const row of rows) {
+      const match = row[2]?.callback_data?.match(/^earnpage_(?:sub|views|bot)_(\d+)$/);
+      if (match) {
+        page = Number(match[1]);
+        break;
+      }
+    }
+
+    const types = EARN_TYPE_MAP[category];
+    const filter = {
+      type: { $in: types },
+      status: "active",
+      ownerTelegramId: { $ne: completingTelegramId },
+      completedBy: { $ne: completingTelegramId },
+      $expr: { $lt: ["$completedCount", "$goalCount"] },
+    };
+
+    const totalCount = await Task.countDocuments(filter);
+    if (!totalCount) {
+      await ctx.editMessageText("No available tasks right now. Check back later!", earnTypeMenu());
+      return;
+    }
+
+    const totalPages = Math.max(1, Math.ceil(totalCount / EARN_PAGE_SIZE));
+    const safePage = Math.min(page, totalPages);
+    const tasks = await Task.find(filter)
+      .sort({ pricePerAction: -1, _id: 1 })
+      .skip((safePage - 1) * EARN_PAGE_SIZE)
+      .limit(EARN_PAGE_SIZE);
+
+    await ctx.editMessageReplyMarkup(
+      earnTaskListMenu(tasks, category, safePage, totalPages).reply_markup
+    );
+  } catch (e) {
+    // "message not modified" (nothing changed) or the message got too old
+    // to edit — both harmless, the user can still reopen 💰 Earnings.
+  }
+}
 
 // "✅ Continue" on the verification prompt, tapped before actually solving
 // the puzzle (the puzzle itself reports success via web_app_data below).
@@ -963,6 +1071,98 @@ bot.on(message("web_app_data"), async (ctx) => {
     user.tasksSinceVerification = 0;
     await user.save();
     await ctx.reply("✅ Verified! You can keep earning — tap Check again on any task.");
+  }
+});
+
+// A private chat's join-request link (see resolveInviteLink/linkType
+// "join_request") normally waits for the chat owner to approve each
+// request by hand. Since our worker is only paid once getChatMember shows
+// them as an actual member (see isUserMemberOf in the verify_ handler), any
+// task using that link type auto-approves join requests immediately instead
+// — the worker gets in (and paid) right away, with no manual step.
+bot.on("chat_join_request", async (ctx) => {
+  try {
+    await dbConnect();
+    const req = ctx.update.chat_join_request;
+    if (!req) return;
+    const chatId = String(req.chat.id);
+
+    const hasJoinRequestTask = await Task.exists({
+      targetChatId: chatId,
+      linkType: "join_request",
+      status: { $ne: "deleted" },
+    });
+    if (!hasJoinRequestTask) return; // not one of our promoted chats — leave it to the owner
+
+    await ctx.telegram.approveChatJoinRequest(chatId, req.from.id);
+  } catch (e) {
+    console.error("Auto-approve join request failed:", e);
+  }
+});
+
+// Fires whenever a user's membership status changes in any chat where the
+// bot is an admin (requires "chat_member" in setWebhook's allowed_updates —
+// see scripts/setWebhook.js). Used to enforce the "must stay subscribed at
+// least MIN_STAY_DAYS days" rule: if a worker leaves/is kicked from a
+// channel/group they were paid to join before that window closes, the GRAM
+// they earned for it is clawed back and returned to the task owner.
+bot.on("chat_member", async (ctx) => {
+  try {
+    await dbConnect();
+    const update = ctx.update.chat_member;
+    if (!update) return;
+
+    const oldStatus = update.old_chat_member?.status;
+    const newStatus = update.new_chat_member?.status;
+    const wasIn = ["member", "administrator", "creator", "restricted"].includes(oldStatus);
+    const isOut = ["left", "kicked"].includes(newStatus);
+    if (!wasIn || !isOut) return;
+
+    const chatId = String(update.chat.id);
+    const telegramId = update.new_chat_member.user.id;
+
+    const tasks = await Task.find({
+      targetChatId: chatId,
+      type: { $in: ["channel", "group"] },
+      completions: { $elemMatch: { telegramId, settled: false } },
+    });
+
+    for (const task of tasks) {
+      let dirty = false;
+      for (const completion of task.completions) {
+        if (completion.telegramId !== telegramId || completion.settled) continue;
+
+        const elapsed = Date.now() - new Date(completion.completedAt).getTime();
+        if (elapsed < MIN_STAY_MS) {
+          const worker = await User.findOne({ telegramId });
+          if (worker) {
+            const deducted = await clawbackEarned(
+              worker,
+              task.pricePerAction,
+              `Left "${task.targetChatTitle || chatId}" before the ${MIN_STAY_DAYS}-day minimum`,
+              task._id
+            );
+            if (deducted > 0) {
+              await creditOwnerReclaimed(task.ownerTelegramId, deducted, task._id);
+              await bot.telegram
+                .sendMessage(
+                  telegramId,
+                  `⚠️ You left "${task.targetChatTitle || "the channel/group"}" before staying ` +
+                    `the required ${MIN_STAY_DAYS} days.\n` +
+                    `💸 ${deducted.toLocaleString()} GRAM earned from that task has been deducted ` +
+                    `from your balance.`
+                )
+                .catch(() => {});
+            }
+          }
+        }
+        completion.settled = true;
+        dirty = true;
+      }
+      if (dirty) await task.save();
+    }
+  } catch (e) {
+    console.error("chat_member handler error:", e);
   }
 });
 

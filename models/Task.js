@@ -60,10 +60,25 @@ const TaskSchema = new mongoose.Schema(
     // Users who already completed this task (so it can't be farmed twice,
     // unless the task is deleted and recreated per the stated rule)
     completedBy: [{ type: Number }],
+
+    // Per-completion records used to enforce the "must stay subscribed at
+    // least 7 days" rule for channel/group tasks. When the chat_member
+    // handler in bot.js sees this user leave/get kicked from targetChatId
+    // before MIN_STAY_MS has passed since completedAt, it claws back
+    // pricePerAction from the worker and returns it to the task owner, then
+    // marks the record `settled` so it's only ever evaluated once.
+    completions: [
+      {
+        telegramId: { type: Number, required: true },
+        completedAt: { type: Date, default: Date.now },
+        settled: { type: Boolean, default: false },
+      },
+    ],
   },
   { timestamps: true }
 );
 
 TaskSchema.index({ type: 1, status: 1, pricePerAction: -1 });
+TaskSchema.index({ targetChatId: 1, "completions.telegramId": 1, "completions.settled": 1 });
 
 export default mongoose.models.Task || mongoose.model("Task", TaskSchema);

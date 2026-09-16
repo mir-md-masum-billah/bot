@@ -23,6 +23,11 @@ const UserSchema = new mongoose.Schema(
     // forcing a fresh verification before further Check taps are accepted.
     isVerified: { type: Boolean, default: true },
     tasksSinceVerification: { type: Number, default: 0 },
+    // Lifetime count of completed earn-tasks. Used only to detect "this was
+    // the user's very first completion ever", which forces one extra
+    // verification right after it (see verify_ handler in bot.js) on top of
+    // the regular every-ANTI_BOT_CHECK_INTERVAL re-verification.
+    totalTasksCompleted: { type: Number, default: 0 },
 
     // Simple in-memory-style state machine for multi-step bot flows
     // (e.g. "waiting for subscriber count", "waiting for chat forward")

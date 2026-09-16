@@ -90,7 +90,27 @@ Visit `https://<your-domain>/admin` → log in with `ADMIN_USERNAME` / `ADMIN_PA
 - **Tasks tab** — see every task, its owner, progress, pause/resume/delete any task.
 - **Users tab** — see every user's balances, ban/unban accounts.
 
-## 7. Important limitations to know about
+## 7. Anti-fraud rules built in
+
+- **Earn list refreshes after every Check.** The list is always sorted highest
+  price first; completing a task removes it and re-renders the same message
+  with the remaining tasks in that order.
+- **Human verification:** required once right after a user's very first
+  completed task ever, then again every 10 completions after that.
+- **7-day minimum stay:** completing a channel/group subscribe task pays
+  immediately, but if the worker leaves (or is removed from) that chat within
+  7 days, the GRAM they were paid is deducted from their balance again and
+  returned to the task owner. This relies on Telegram's `chat_member` update,
+  which only arrives if you (re-)run `scripts/setWebhook.js` **after this
+  update** — it now explicitly requests `chat_member` and
+  `chat_join_request` in `allowed_updates` (Telegram doesn't send either by
+  default). If you already had a webhook registered, re-run the script once.
+- **Join-request links auto-approve.** For tasks using the "join-request"
+  link type on a private chat, the bot approves every join request for that
+  chat immediately, so the worker is let in — and can then pass the regular
+  membership Check — right away instead of waiting on the owner.
+
+## 8. Important limitations to know about
 
 - **Views/Bot task types can't be verified automatically** — Telegram's API has no way
   to confirm a "view" or a bot interaction the way `getChatMember` confirms a channel
@@ -107,7 +127,7 @@ Visit `https://<your-domain>/admin` → log in with `ADMIN_USERNAME` / `ADMIN_PA
   fingerprinting is not available via Telegram, but repeated join/leave patterns can be
   flagged), and proper logging/monitoring.
 
-## 8. Local development
+## 9. Local development
 
 ```bash
 npm install
