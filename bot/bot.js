@@ -27,7 +27,13 @@ import {
 } from "./keyboards.js";
 import { nextCounterValue } from "../models/Counter.js";
 
-const COMMISSION_PERCENT = Number(process.env.EARNED_COMMISSION_PERCENT || 10);
+const _rawCommissionPercent = Number(process.env.EARNED_COMMISSION_PERCENT || 10);
+if (!Number.isFinite(_rawCommissionPercent)) {
+  console.error(
+    `Invalid EARNED_COMMISSION_PERCENT env value (${process.env.EARNED_COMMISSION_PERCENT}) — falling back to 10%`
+  );
+}
+const COMMISSION_PERCENT = Number.isFinite(_rawCommissionPercent) ? _rawCommissionPercent : 10;
 // No official published GRAM<->Stars rate exists for this kind of bot —
 // this is a configurable approximation, not a real exchange rate. Adjust
 // via env var to whatever rate you actually want to offer.
@@ -155,7 +161,7 @@ async function clawbackEarned(user, amount, note, relatedTaskId) {
 // Returns reclaimed GRAM to the task owner's donated balance (same pool
 // used for task-deletion refunds), so it costs no commission to reuse.
 async function creditOwnerReclaimed(ownerTelegramId, amount, relatedTaskId) {
-  if (amount <= 0) return;
+  if (!Number.isFinite(amount) || amount <= 0) return;
   const owner = await User.findOne({ telegramId: ownerTelegramId });
   if (!owner) return;
   owner.donatedBalance += amount;
@@ -182,6 +188,14 @@ async function spendForTask(user, totalCost) {
 
   if (fromEarned > 0) {
     commission = Math.ceil((fromEarned * COMMISSION_PERCENT) / 100);
+  }
+
+  // Belt-and-suspenders: even though totalCost and COMMISSION_PERCENT are
+  // both validated above, refuse to proceed if commission somehow still
+  // came out non-finite rather than letting it poison earnedBalance below.
+  if (!Number.isFinite(commission)) {
+    console.error(`spendForTask: refusing non-finite commission (${commission}) for user ${user.telegramId}`);
+    return { ok: false, needed: 0, invalid: true };
   }
 
   const grandTotal = fromDonated + fromEarned + commission;
