@@ -59,6 +59,21 @@ const AUTO_DELETE_MESSAGES = false;
 // A single Telegraf instance is reused across warm serverless invocations.
 export const bot = new Telegraf(process.env.BOT_TOKEN);
 
+// Without this, an error thrown anywhere in a handler (a bad DB write, a
+// Telegram API call failing, etc.) is only logged by Telegraf's default
+// handler as "Unhandled error while processing <update>" with the actual
+// error message easy to lose in serverless logs, AND the tapped button is
+// left with no response at all (Telegram just clears the loading spinner
+// after its own timeout, so it looks like "the button doesn't work"). This
+// logs the real error clearly and — for button taps — answers the callback
+// so the person sees a message instead of silence.
+bot.catch((err, ctx) => {
+  console.error(`Bot error for update ${ctx.update?.update_id}:`, err);
+  if (ctx.callbackQuery) {
+    ctx.answerCbQuery("⚠️ Something went wrong, please try again.").catch(() => {});
+  }
+});
+
 const TYPE_LABELS = {
   channel: "📢 Channel",
   group: "👥 Group",
@@ -952,31 +967,61 @@ bot.action(/verify_(.+)/, async (ctx) => {
     return;
   }
 
-  task.completedCount += 1;
-  task.completedBy.push(user.telegramId);
-  // Recorded so the chat_member handler can later check whether this user
-  // stayed subscribed at least MIN_STAY_DAYS before clawing the reward back.
-  task.completions.push({ telegramId: user.telegramId, completedAt: new Date() });
-  if (task.completedCount >= task.goalCount) task.status = "completed";
-  await task.save();
+  // Atomic, filtered update: only succeeds if the task is still active, not
+  // yet full, and this user hasn't already completed it — all checked and
+  // written in one DB operation. This is what actually prevents the "Check
+  // button doesn't work" failures seen in the logs: tapping Check more than
+  // once quickly fires multiple concurrent requests, and the old
+  // load-then-save pattern let two of them race on the same document,
+  // throwing a Mongoose VersionError on the loser (visible only as an
+  // "Unhandled error" with no user-facing response). findOneAndUpdate can't
+  // lose that race — the filter simply won't match a second time.
+  const updatedTask = await Task.findOneAndUpdate(
+    {
+      _id: task._id,
+      status: "active",
+      completedBy: { $ne: user.telegramId },
+      $expr: { $lt: ["$completedCount", "$goalCount"] },
+    },
+    {
+      $inc: { completedCount: 1 },
+      $push: {
+        completedBy: user.telegramId,
+        // Recorded so the chat_member handler can later check whether this
+        // user stayed subscribed at least MIN_STAY_DAYS before clawing the
+        // reward back.
+        completions: { telegramId: user.telegramId, completedAt: new Date() },
+      },
+    },
+    { new: true }
+  );
 
-  await creditEarned(user, task.pricePerAction, "Completed promotion task", task._id);
+  if (!updatedTask) {
+    await ctx.answerCbQuery("You already completed this task, or it just filled up.");
+    return;
+  }
+  if (updatedTask.completedCount >= updatedTask.goalCount && updatedTask.status === "active") {
+    updatedTask.status = "completed";
+    await updatedTask.save();
+  }
+
+  await creditEarned(user, updatedTask.pricePerAction, "Completed promotion task", updatedTask._id);
 
   const taskNumber = await nextCounterValue("completions", 800000);
   const balance = user.donatedBalance + user.earnedBalance;
   await ctx.answerCbQuery("✅ Verified! Coins added.");
   await ctx.reply(
     `✅ Task №${taskNumber.toLocaleString()} completed\n\n` +
-      `💵 You received +${task.pricePerAction.toLocaleString()} GRAM\n` +
+      `💵 You received +${updatedTask.pricePerAction.toLocaleString()} GRAM\n` +
       `💰 Balance: ${balance.toLocaleString()} GRAM\n\n` +
-      (task.type === "channel" || task.type === "group"
+      (updatedTask.type === "channel" || updatedTask.type === "group"
         ? `ℹ️ Stay subscribed at least ${MIN_STAY_DAYS} days — leaving early gets this reward deducted again.`
         : "")
   );
 
   // Refresh the earn list in place: remove the just-completed task and
   // re-sort so the highest-paying remaining task is back on top.
-  await refreshEarnListInPlace(ctx, task, user.telegramId);
+  await refreshEarnListInPlace(ctx, updatedTask, user.telegramId);
 
   user.totalTasksCompleted += 1;
   user.tasksSinceVerification += 1;
