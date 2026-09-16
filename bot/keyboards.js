@@ -92,10 +92,10 @@ export const adminStatusReplyMenu = () =>
   Markup.keyboard([["🏠 I'm an admin"], ["👁 I'm not an admin"], ["⬅️ Back"]]).resize();
 
 // Telegram's `startchannel` / `startgroup` deep links open Telegram's own
-// native picker of every channel/group the user administers, and let them
-// grant the requested admin rights to the bot in one tap. This is Telegram
-// UI, not something a bot can build itself — there is no Bot API call that
-// returns "which chats does this user manage".
+// native picker listing every channel/group the user administers, and let
+// them grant the requested admin rights to the bot in one tap. This is
+// Telegram UI, not something a bot can build itself — there is no Bot API
+// call that returns "which chats does this user manage".
 export const addBotMenu = (type, botUsername) => {
   const rights = "invite_users"; // minimal right needed for getChatMember checks
   const param = type === "channel" ? "startchannel" : "startgroup";

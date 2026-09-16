@@ -271,40 +271,41 @@ bot.action(/promote_(channel|group)/, async (ctx) => {
   );
 });
 
-// "🏠 I'm an admin" — proceed straight to the price step.
+// "🏠 I'm an admin" — the user says they administer the target chat
+// themselves, so show Telegram's own native add-to-channel/add-to-group
+// picker. Telegram lists every chat the user manages and lets them grant
+// admin rights to the bot in one tap — a bot cannot build this list itself,
+// there is no Bot API call for "which chats does this user administer".
 bot.hears("🏠 I'm an admin", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await tryDeleteUserMessage(ctx);
   if (user.sessionState !== "choosing_admin_status") return;
   const { type } = user.sessionData;
-  await setSession(user, "awaiting_price", { type });
+  const botUsername = await getBotUsername();
   await ctx.reply(
-    `${TYPE_LABELS[type]} selected.\n\n` +
-      `💡 Send the price (in coins) you want to pay per completion.\n` +
-      `Tip: check the "Earn" section for current prices — higher prices get completed faster.`,
-    replyMainMenu()
+    `➕ Tap the button below to add me as admin to your ${type}.\n\n` +
+      `Telegram will show you a list of the ${type}s you manage — pick one and ` +
+      `confirm the admin permissions. Then come back here and tap "I've added it — Continue".`,
+    addBotMenu(type, botUsername)
   );
 });
 
-// "👁 I'm not an admin" — show a button that opens Telegram's own
-// add-to-channel/add-to-group picker. Telegram (not this bot) lists every
-// channel/group the user administers and lets them grant admin rights to
-// the bot in one tap — a bot has no API to fetch that list itself, so this
-// native picker is the only way to offer a "choose from your channels" flow.
+// "👁 I'm not an admin" — the user wants to promote a chat they don't
+// personally manage. The bot still needs to be added as admin somewhere,
+// so this opens the same native picker; if the target chat isn't theirs,
+// they'll need the actual admin of that chat to add the bot instead.
 bot.hears("👁 I'm not an admin", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await tryDeleteUserMessage(ctx);
   if (user.sessionState !== "choosing_admin_status") return;
   const { type } = user.sessionData;
-  await ctx.reply(
-    `⚠️ Okay — let's add me as an admin to your ${type} first.`,
-    replyMainMenu()
-  );
   const botUsername = await getBotUsername();
   await ctx.reply(
-    `➕ Tap the button below to add me as an admin to your ${type}.\n\n` +
-      `Telegram will show you a list of the ${type}s you manage — pick one and ` +
-      `confirm the admin permissions. Then come back here and tap "I've added it".`,
+    `⚠️ Okay — I still need to be an admin in the ${type} to run the promotion.\n\n` +
+      `If it's your own ${type}, tap the button below — Telegram will show you a list of the ` +
+      `${type}s you manage, pick one and confirm the admin permissions.\n\n` +
+      `If it belongs to someone else, ask them to add me as an admin manually, then come back ` +
+      `and tap "I've added it — Continue".`,
     addBotMenu(type, botUsername)
   );
 });
@@ -703,6 +704,29 @@ async function handleChatInput(ctx, user, message) {
     return;
   }
 
+  let chatInfo;
+  try {
+    chatInfo = await bot.telegram.getChat(chatId);
+  } catch (e) {
+    await ctx.reply("Couldn't read that chat. Please try again.");
+    return;
+  }
+
+  const { type, price, count } = user.sessionData;
+  await createTask(ctx, user, {
+    type,
+    price,
+    count,
+    chatId: String(chatId),
+    chatTitle: chatInfo.title,
+    chatUsername: chatInfo.username,
+  });
+}
+
+// Shared task-creation step used once the target chat is known (from a
+// forwarded message or @username). Confirms the bot is actually an admin
+// there before spending any coins.
+async function createTask(ctx, user, { type, price, count, chatId, chatTitle, chatUsername }) {
   const adminOk = await isBotAdminIn(chatId);
   if (!adminOk) {
     await ctx.reply(
@@ -712,16 +736,7 @@ async function handleChatInput(ctx, user, message) {
     return;
   }
 
-  let chatInfo;
-  try {
-    chatInfo = await bot.telegram.getChat(chatId);
-  } catch (e) {
-    await ctx.reply("Couldn't read that chat. Please try again.");
-    return;
-  }
-
   await dbConnect();
-  const { type, price, count } = user.sessionData;
   const spend = await spendForTask(user, price * count);
   if (!spend.ok) {
     await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} coins.`);
@@ -732,8 +747,8 @@ async function handleChatInput(ctx, user, message) {
     ownerTelegramId: user.telegramId,
     type,
     targetChatId: String(chatId),
-    targetChatTitle: chatInfo.title,
-    targetChatUsername: chatInfo.username,
+    targetChatTitle: chatTitle,
+    targetChatUsername: chatUsername,
     pricePerAction: price,
     goalCount: count,
   });
@@ -741,7 +756,7 @@ async function handleChatInput(ctx, user, message) {
   await clearSession(user);
   await ctx.reply(
     `✅ Task created!\n\n` +
-      `${TYPE_LABELS[type]} — ${chatInfo.title || chatUsername}\n` +
+      `${TYPE_LABELS[type]} — ${chatTitle || chatUsername}\n` +
       `Price: ${price} coins × ${count} = ${price * count} coins` +
       (spend.commission ? ` (+${spend.commission} commission)` : "") +
       `\n\nTrack it under 🗂 My Cabinet → My Tasks.`,
