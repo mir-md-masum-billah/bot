@@ -66,11 +66,26 @@ export const taskManageMenu = (taskId, status) =>
 
 // One row per task: a URL button to actually open/join the chat, paired
 // with a "Check" button the bot uses to verify membership and pay out.
+// Post-view tasks work differently from subscribe tasks: there is nothing
+// to open and no membership to check. Tapping the button makes the bot
+// forward the promoted post straight into this chat and pay immediately,
+// so it's a single callback button per task (matching "👁 View Post +N GRAM").
 export const earnTaskListMenu = (tasks, category, page, totalPages) => {
-  const rows = tasks.map((t) => [
-    Markup.button.url(`💲 +${t.pricePerAction} | Subscribe`, t.targetInviteLink || "https://t.me"),
-    Markup.button.callback("🔄 Check", `verify_${t._id}`),
-  ]);
+  const rows =
+    category === "views"
+      ? tasks.map((t) => [
+          Markup.button.callback(
+            `👁 View Post +${t.pricePerAction} GRAM`,
+            `viewpost_${t._id}`
+          ),
+        ])
+      : tasks.map((t) => [
+          Markup.button.url(
+            `💲 +${t.pricePerAction} | Subscribe`,
+            t.targetInviteLink || "https://t.me"
+          ),
+          Markup.button.callback("🔄 Check", `verify_${t._id}`),
+        ]);
 
   rows.push([
     Markup.button.callback("1", `earnpage_${category}_1`),
@@ -79,11 +94,45 @@ export const earnTaskListMenu = (tasks, category, page, totalPages) => {
     Markup.button.callback(">", `earnpage_${category}_${Math.min(totalPages, page + 1)}`),
     Markup.button.callback(`${totalPages}`, `earnpage_${category}_${totalPages}`),
   ]);
-  rows.push([Markup.button.callback("❌ Report", `earnreport_${category}_${page}`)]);
+  // Views tasks get their own Report button right under the post the user
+  // just saw (see afterViewMenu), so the generic one is only for the rest.
+  if (category !== "views") {
+    rows.push([Markup.button.callback("❌ Report", `earnreport_${category}_${page}`)]);
+  }
   rows.push([Markup.button.callback("⬅️ Back", "menu_earn")]);
 
   return Markup.inlineKeyboard(rows);
 };
+
+// ---------- post (views) promotion + viewing ----------
+
+// Shown while the bot waits for the user to forward the post they want
+// promoted. Only "⬅️ Back" — the actual input is a forwarded message.
+export const postForwardMenu = () => Markup.keyboard([["⬅️ Back"]]).resize();
+
+// Shown when the bot isn't an admin in the channel the post came from.
+// The deep link opens Telegram's own "Choose a Channel" dialog and grants
+// the listed admin rights in one step.
+export const addBotToChannelMenu = (addBotLink) =>
+  Markup.inlineKeyboard([
+    [Markup.button.url("➕ Add bot to channel", addBotLink)],
+    [Markup.button.callback("🔄 Check again", "postadmin_recheck")],
+  ]);
+
+// Sent right after a worker is shown a promoted post and paid for it.
+export const afterViewMenu = (taskId) =>
+  Markup.inlineKeyboard([
+    [Markup.button.callback("➡️ Next Post", "earn_views")],
+    [Markup.button.callback("❌ Report", `postreport_${taskId}`)],
+    [Markup.button.callback("⬅️ Back", "menu_earn")],
+  ]);
+
+export const reportReasonMenu = (taskId) =>
+  Markup.inlineKeyboard([
+    [Markup.button.callback("🔞 Inappropriate content", `prsn_${taskId}_adult`)],
+    [Markup.button.callback("📝 Other reason", `prsn_${taskId}_other`)],
+    [Markup.button.callback("⬅️ Back", "earn_views")],
+  ]);
 
 // Shown when a user's periodic human-verification is due (see
 // ANTI_BOT_CHECK_INTERVAL in bot.js) before any further Check taps count.

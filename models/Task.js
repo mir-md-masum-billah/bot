@@ -19,6 +19,24 @@ const TaskSchema = new mongoose.Schema(
     // @username (see resolveInviteLink in bot.js).
     targetInviteLink: String,
 
+    // For "views" (post promotion) tasks only: the exact post inside
+    // targetChatId that workers are shown. The bot forwards THIS message
+    // from the original channel to each worker — which is the whole reason
+    // the bot must be an admin in that channel before the task is created.
+    targetMessageId: { type: Number },
+
+    // Reports filed by workers who saw the post (adult/inappropriate
+    // content, scam, etc). After REPORT_AUTO_PAUSE reports the task is
+    // paused automatically and the owner is notified.
+    reportCount: { type: Number, default: 0 },
+    reports: [
+      {
+        telegramId: { type: Number, required: true },
+        reason: { type: String, required: true },
+        createdAt: { type: Date, default: Date.now },
+      },
+    ],
+
     // Regular invite link (members join instantly) vs join-request link
     // (owner must approve; worker is paid as soon as they submit the request).
     linkType: {

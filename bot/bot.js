@@ -24,16 +24,14 @@ import {
   publishConfirmMenu,
   earnTaskListMenu,
   humanVerifyMenu,
+  postForwardMenu,
+  addBotToChannelMenu,
+  afterViewMenu,
+  reportReasonMenu,
 } from "./keyboards.js";
 import { nextCounterValue } from "../models/Counter.js";
 
-const _rawCommissionPercent = Number(process.env.EARNED_COMMISSION_PERCENT || 10);
-if (!Number.isFinite(_rawCommissionPercent)) {
-  console.error(
-    `Invalid EARNED_COMMISSION_PERCENT env value (${process.env.EARNED_COMMISSION_PERCENT}) — falling back to 10%`
-  );
-}
-const COMMISSION_PERCENT = Number.isFinite(_rawCommissionPercent) ? _rawCommissionPercent : 10;
+const COMMISSION_PERCENT = Number(process.env.EARNED_COMMISSION_PERCENT || 10);
 // No official published GRAM<->Stars rate exists for this kind of bot —
 // this is a configurable approximation, not a real exchange rate. Adjust
 // via env var to whatever rate you actually want to offer.
@@ -161,7 +159,7 @@ async function clawbackEarned(user, amount, note, relatedTaskId) {
 // Returns reclaimed GRAM to the task owner's donated balance (same pool
 // used for task-deletion refunds), so it costs no commission to reuse.
 async function creditOwnerReclaimed(ownerTelegramId, amount, relatedTaskId) {
-  if (!Number.isFinite(amount) || amount <= 0) return;
+  if (amount <= 0) return;
   const owner = await User.findOne({ telegramId: ownerTelegramId });
   if (!owner) return;
   owner.donatedBalance += amount;
@@ -188,14 +186,6 @@ async function spendForTask(user, totalCost) {
 
   if (fromEarned > 0) {
     commission = Math.ceil((fromEarned * COMMISSION_PERCENT) / 100);
-  }
-
-  // Belt-and-suspenders: even though totalCost and COMMISSION_PERCENT are
-  // both validated above, refuse to proceed if commission somehow still
-  // came out non-finite rather than letting it poison earnedBalance below.
-  if (!Number.isFinite(commission)) {
-    console.error(`spendForTask: refusing non-finite commission (${commission}) for user ${user.telegramId}`);
-    return { ok: false, needed: 0, invalid: true };
   }
 
   const grandTotal = fromDonated + fromEarned + commission;
@@ -233,6 +223,47 @@ async function isBotAdminIn(chatId) {
   } catch (e) {
     return false;
   }
+}
+
+// Admin rights requested by the "➕ Add bot to channel" deep link. The bot
+// only really needs to be an admin at all (so it can read + forward the
+// post), but Telegram shows this exact list in its confirmation dialog.
+const POST_ADMIN_RIGHTS = "post_messages+edit_messages+delete_messages+invite_users";
+
+// Built from getMe() rather than an env var so it can never point at the
+// wrong bot if BOT_USERNAME is stale or missing.
+let cachedBotUsername = null;
+async function addBotToChannelLink() {
+  if (!cachedBotUsername) {
+    cachedBotUsername = (await bot.telegram.getMe()).username;
+  }
+  return `https://t.me/${cachedBotUsername}?startchannel&admin=${POST_ADMIN_RIGHTS}`;
+}
+
+// Pulls (chat, message_id) out of a forwarded message. Bot API 7.0+ sends
+// this as `forward_origin`; older payloads use the deprecated flat fields,
+// so both are handled. Anything that isn't a channel post — a forward from
+// a user, a hidden-account forward, or a plain copy-paste — returns null,
+// because only channel posts carry a message_id the bot can forward later.
+function extractForwardedPost(message) {
+  const origin = message?.forward_origin;
+  if (origin?.type === "channel" && origin.chat && origin.message_id) {
+    return {
+      chatId: origin.chat.id,
+      messageId: origin.message_id,
+      title: origin.chat.title,
+      username: origin.chat.username,
+    };
+  }
+  if (message?.forward_from_chat?.type === "channel" && message.forward_from_message_id) {
+    return {
+      chatId: message.forward_from_chat.id,
+      messageId: message.forward_from_message_id,
+      title: message.forward_from_chat.title,
+      username: message.forward_from_chat.username,
+    };
+  }
+  return null;
 }
 
 async function isUserMemberOf(chatId, userId) {
@@ -369,7 +400,10 @@ bot.action("menu_cabinet", async (ctx) => {
 // Types that need a target channel/group picked via Telegram's native
 // `request_chat` flow. "bot" targets another bot (not a chat), so it keeps
 // the simpler legacy price->count->@username flow further below instead.
-const CHAT_PICKER_TYPES = ["channel", "group", "views", "boost", "reactions"];
+// "views" is NOT here: a post task needs one specific message, and the chat
+// picker only returns a chat id. It uses the forward-the-post flow instead
+// (see startPostWizard / the forwarded-post middleware below).
+const CHAT_PICKER_TYPES = ["channel", "group", "boost", "reactions"];
 
 async function showPromoteTypeMenu(ctx, user) {
   await setSession(user, "promote_type_menu", {});
@@ -401,6 +435,15 @@ async function renderWizardStep(ctx, user, state) {
       await ctx.reply(
         "📢 Choose a chat or channel to promote (the bot must be an admin)",
         adminStatusReplyMenu(d.type)
+      );
+      return;
+    case "awaiting_post_forward":
+      await ctx.reply(
+        `📣 Forward the post you want to promote.\n\n` +
+          `Open the channel → pick the post → Forward → this bot\n\n` +
+          `⚠️ I must be an admin in that channel, otherwise I can't show the ` +
+          `post to workers later.`,
+        postForwardMenu()
       );
       return;
     case "choosing_link_type":
@@ -443,8 +486,9 @@ async function renderWizardStep(ctx, user, state) {
       return;
     case "wizard_awaiting_price": {
       const min = computeMinPrice(d.audienceMode, d.languages);
+      const unit = d.type === "views" ? "view" : "subscription";
       await ctx.reply(
-        `💲 Set the price for 1 subscription — this is the worker's reward.\n\n` +
+        `💲 Set the price for 1 ${unit} — this is the worker's reward.\n\n` +
           `Minimum — ${min} GRAM\n` +
           `💡 Recommended — ${min + RECOMMENDED_SURCHARGE} GRAM\n` +
           `Completion speed depends on your price.`
@@ -454,9 +498,10 @@ async function renderWizardStep(ctx, user, state) {
     case "wizard_choosing_count": {
       const total = user.donatedBalance + user.earnedBalance;
       const maxForBalance = Math.max(1, Math.floor(total / d.price));
+      const unit = d.type === "views" ? "views" : "subscriptions";
       await ctx.reply(
-        `🧾 Enter the number of subscriptions or choose:\n` +
-          `💵 Subscription price — ${d.price} GRAM\n` +
+        `🧾 Enter the number of ${unit} or choose:\n` +
+          `💵 ${d.type === "views" ? "View" : "Subscription"} price — ${d.price} GRAM\n` +
           `💰 Your balance — ${total.toLocaleString()} GRAM`,
         countMenu(maxForBalance)
       );
@@ -502,7 +547,100 @@ async function startChatPickerWizard(ctx, type) {
 
 bot.hears("📢 Channel", (ctx) => startChatPickerWizard(ctx, "channel"));
 bot.hears("👥 Group", (ctx) => startChatPickerWizard(ctx, "group"));
-bot.hears("👁 Post", (ctx) => startChatPickerWizard(ctx, "views"));
+// A post task can't use the chat picker — Telegram's picker returns a chat,
+// never a specific message — so the user forwards the actual post instead.
+async function startPostWizard(ctx) {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "promote_type_menu") return;
+  await tryDeleteUserMessage(ctx);
+  await goForward(user, "awaiting_post_forward", { type: "views" });
+  await renderWizardStep(ctx, user, "awaiting_post_forward");
+}
+
+bot.hears("👁 Post", startPostWizard);
+
+// Runs before the generic bot.on("text") handler further down, and only
+// touches the DB when the incoming message actually is a forwarded channel
+// post — every other update falls straight through to next().
+bot.use(async (ctx, next) => {
+  const post = ctx.message && extractForwardedPost(ctx.message);
+  if (!post) return next();
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "awaiting_post_forward") return next();
+  await handlePostForward(ctx, user, post);
+});
+
+async function handlePostForward(ctx, user, post) {
+  // 1) Is the bot an admin in the channel this post came from? Without it,
+  //    forwardMessage to workers fails later — so it's checked up front,
+  //    before the user spends anything.
+  if (!(await isBotAdminIn(post.chatId))) {
+    await setSession(user, "awaiting_post_forward", {
+      ...user.sessionData,
+      pendingChatId: String(post.chatId),
+      pendingMessageId: post.messageId,
+      pendingTitle: post.title,
+      pendingUsername: post.username,
+    });
+    await ctx.reply(
+      `⛔️ The bot lacks admin rights in "${post.title || "that channel"}".\n` +
+        `Add the bot to the channel and try again.`,
+      addBotToChannelMenu(await addBotToChannelLink())
+    );
+    return;
+  }
+
+  // 2) Admin rights alone aren't enough: a channel with "Restrict saving
+  //    content" on blocks forwarding entirely. Prove it works now by
+  //    forwarding the post to the owner and deleting it again, rather than
+  //    letting every worker hit the error after the task is paid for.
+  try {
+    const probe = await bot.telegram.forwardMessage(ctx.chat.id, post.chatId, post.messageId, {
+      disable_notification: true,
+    });
+    await bot.telegram.deleteMessage(ctx.chat.id, probe.message_id).catch(() => {});
+  } catch (e) {
+    await ctx.reply(
+      `⛔️ I can't forward that post.\n\n` +
+        `Turn off "Restrict saving content" in the channel settings (or check ` +
+        `that the post still exists) and forward it again.`
+    );
+    return;
+  }
+
+  await goForward(user, "choosing_audience_main", {
+    targetChatId: String(post.chatId),
+    targetChatTitle: post.title,
+    targetChatUsername: post.username,
+    targetMessageId: post.messageId,
+    linkType: "regular",
+  });
+  await renderWizardStep(ctx, user, "choosing_audience_main");
+}
+
+// "🔄 Check again" after the user has (hopefully) granted admin rights.
+bot.action("postadmin_recheck", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  const d = user.sessionData || {};
+  if (!d.pendingChatId) {
+    await ctx.answerCbQuery("Please forward the post again.", { show_alert: true });
+    return;
+  }
+  if (!(await isBotAdminIn(d.pendingChatId))) {
+    await ctx.answerCbQuery("Still not an admin there — grant the rights and retry.", {
+      show_alert: true,
+    });
+    return;
+  }
+  await ctx.answerCbQuery("✅ Admin rights OK");
+  await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+  await handlePostForward(ctx, user, {
+    chatId: d.pendingChatId,
+    messageId: d.pendingMessageId,
+    title: d.pendingTitle,
+    username: d.pendingUsername,
+  });
+});
 bot.hears("⚡️ Premium boost (channel)", (ctx) => startChatPickerWizard(ctx, "boost"));
 bot.hears("❤️ Reactions", (ctx) => startChatPickerWizard(ctx, "reactions"));
 
@@ -665,7 +803,23 @@ async function createWizardTask(ctx, user, paymentMethod) {
   const d = user.sessionData;
   const totalGram = d.price * d.count;
 
-  const inviteLink = await resolveInviteLink(d.targetChatId, d.targetChatUsername, d.linkType);
+  // A post task lives or dies on the bot still being an admin in the source
+  // channel — the owner could have removed it between forwarding the post
+  // and tapping Publish, so it's verified one last time before any GRAM
+  // changes hands. There's also no invite link to resolve for this type.
+  let inviteLink = null;
+  if (d.type === "views") {
+    if (!(await isBotAdminIn(d.targetChatId))) {
+      await ctx.reply(
+        `⛔️ The bot lacks admin rights in "${d.targetChatTitle || "that channel"}" anymore, ` +
+          `so the task can't be published.`,
+        addBotToChannelMenu(await addBotToChannelLink())
+      );
+      return;
+    }
+  } else {
+    inviteLink = await resolveInviteLink(d.targetChatId, d.targetChatUsername, d.linkType);
+  }
 
   let commission = 0;
   if (paymentMethod === "gram") {
@@ -689,6 +843,7 @@ async function createWizardTask(ctx, user, paymentMethod) {
     targetChatTitle: d.targetChatTitle,
     targetChatUsername: d.targetChatUsername,
     targetInviteLink: inviteLink,
+    targetMessageId: d.targetMessageId,
     linkType: d.linkType,
     audienceMode: d.audienceMode,
     languages: d.languages || [],
@@ -926,18 +1081,29 @@ async function promptHumanVerification(ctx, user) {
   );
 }
 
+// Shared filter for every earn list (first page, pagination, and the
+// in-place refresh after a completion) so they can never drift apart.
+// Post tasks additionally require a stored targetMessageId — tasks created
+// before the post flow existed have none and could never be forwarded, so
+// they're hidden instead of failing in the worker's face.
+function buildEarnFilter(types, category, telegramId) {
+  const filter = {
+    type: { $in: types },
+    status: "active",
+    ownerTelegramId: { $ne: telegramId },
+    completedBy: { $ne: telegramId },
+    $expr: { $lt: ["$completedCount", "$goalCount"] },
+  };
+  if (category === "views") filter.targetMessageId = { $exists: true, $ne: null };
+  return filter;
+}
+
 async function showEarnList(ctx, user, category, page = 1) {
   await dbConnect();
   const types = EARN_TYPE_MAP[category];
   if (!types) return;
 
-  const filter = {
-    type: { $in: types },
-    status: "active",
-    ownerTelegramId: { $ne: user.telegramId },
-    completedBy: { $ne: user.telegramId },
-    $expr: { $lt: ["$completedCount", "$goalCount"] },
-  };
+  const filter = buildEarnFilter(types, category, user.telegramId);
 
   const totalCount = await Task.countDocuments(filter);
   if (!totalCount) {
@@ -954,7 +1120,10 @@ async function showEarnList(ctx, user, category, page = 1) {
     .limit(EARN_PAGE_SIZE);
 
   await ctx.reply(
-    `${TYPE_LABELS[types[0]]} tasks — tap Subscribe to open it, then Check to get paid.`,
+    category === "views"
+      ? `👁 Post tasks — tap a post to view it and get paid instantly.\n\n` +
+          `⚠️ Attention! Some posts are long — scroll them up and down.`
+      : `${TYPE_LABELS[types[0]]} tasks — tap Subscribe to open it, then Check to get paid.`,
     earnTaskListMenu(tasks, category, safePage, totalPages)
   );
 }
@@ -971,13 +1140,7 @@ bot.action(/earnpage_(sub|views|bot)_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
   await dbConnect();
   const types = EARN_TYPE_MAP[category];
-  const filter = {
-    type: { $in: types },
-    status: "active",
-    ownerTelegramId: { $ne: user.telegramId },
-    completedBy: { $ne: user.telegramId },
-    $expr: { $lt: ["$completedCount", "$goalCount"] },
-  };
+  const filter = buildEarnFilter(types, category, user.telegramId);
   const totalCount = await Task.countDocuments(filter);
   const totalPages = Math.max(1, Math.ceil(totalCount / EARN_PAGE_SIZE));
   const page = Math.min(Math.max(1, Number(pageStr)), totalPages);
@@ -1000,6 +1163,164 @@ bot.action(/earnreport_(sub|views|bot)_(\d+)/, async (ctx) => {
     { show_alert: true }
   );
 });
+
+// A views task is paused automatically once this many workers report it,
+// so a bad post stops circulating without waiting for manual moderation.
+const REPORT_AUTO_PAUSE = 3;
+
+// ---------- post (views) tasks: show the post, pay, allow reporting ----------
+
+bot.action(/viewpost_(.+)/, async (ctx) => {
+  await dbConnect();
+  const user = await getOrCreateUser(ctx);
+  const task = await Task.findById(ctx.match[1]);
+
+  if (!task || task.status !== "active" || task.completedCount >= task.goalCount) {
+    await ctx.answerCbQuery("This task is no longer available.");
+    return;
+  }
+  if (task.completedBy.includes(user.telegramId)) {
+    await ctx.answerCbQuery("You already viewed this post.");
+    return;
+  }
+  if (!task.targetMessageId) {
+    await ctx.answerCbQuery("This task is missing its post — skipping it.");
+    return;
+  }
+  if (!user.isVerified) {
+    await ctx.answerCbQuery();
+    await promptHumanVerification(ctx, user);
+    return;
+  }
+
+  // Show the post first. Forwarding from the original channel (rather than
+  // copying it) is what makes the view count for the owner AND keeps the
+  // "Forwarded from <channel>" header, so the worker can see the source.
+  try {
+    await bot.telegram.forwardMessage(user.telegramId, task.targetChatId, task.targetMessageId);
+  } catch (e) {
+    // Post deleted, or the bot was removed as admin. Pause the task so no
+    // one else hits this, and tell the owner how to fix or refund it.
+    if (task.status === "active") {
+      task.status = "paused";
+      await task.save();
+      await bot.telegram
+        .sendMessage(
+          task.ownerTelegramId,
+          `⏸ Your post task "${task.targetChatTitle || task.targetChatId}" was paused — ` +
+            `I can no longer forward that post.\n\n` +
+            `Either the post was deleted, or I'm not an admin in the channel anymore. ` +
+            `Fix it and resume from 👤 My Cabinet → 📋 My Tasks, or delete the task to ` +
+            `get the unused GRAM refunded.`
+        )
+        .catch(() => {});
+    }
+    await ctx.answerCbQuery("That post isn't available anymore — try another one.", {
+      show_alert: true,
+    });
+    return;
+  }
+
+  // Same atomic claim the subscribe flow uses: the filter can only match
+  // once, so double-tapping can never pay twice.
+  const updatedTask = await Task.findOneAndUpdate(
+    {
+      _id: task._id,
+      status: "active",
+      completedBy: { $ne: user.telegramId },
+      $expr: { $lt: ["$completedCount", "$goalCount"] },
+    },
+    {
+      $inc: { completedCount: 1 },
+      $push: {
+        completedBy: user.telegramId,
+        completions: { telegramId: user.telegramId, completedAt: new Date() },
+      },
+    },
+    { new: true }
+  );
+
+  if (!updatedTask) {
+    await ctx.answerCbQuery("You already viewed this post, or it just filled up.");
+    return;
+  }
+  if (updatedTask.completedCount >= updatedTask.goalCount && updatedTask.status === "active") {
+    updatedTask.status = "completed";
+    await updatedTask.save();
+  }
+
+  await creditEarned(user, updatedTask.pricePerAction, "Viewed promoted post", updatedTask._id);
+
+  const postNumber = await nextCounterValue("completions", 800000);
+  const balance = user.donatedBalance + user.earnedBalance;
+  await ctx.answerCbQuery("✅ Paid!");
+  await ctx.reply(
+    `💲 You earned +${updatedTask.pricePerAction.toLocaleString()} GRAM for viewing post ` +
+      `#${postNumber.toLocaleString()}!\n` +
+      `💰 Your balance: ${balance.toLocaleString()} GRAM`,
+    afterViewMenu(updatedTask._id.toString())
+  );
+
+  await refreshEarnListInPlace(ctx, updatedTask, user.telegramId);
+
+  user.totalTasksCompleted += 1;
+  user.tasksSinceVerification += 1;
+  const isFirstEverCompletion = user.totalTasksCompleted === 1;
+  if (isFirstEverCompletion || user.tasksSinceVerification >= ANTI_BOT_CHECK_INTERVAL) {
+    user.tasksSinceVerification = 0;
+    user.isVerified = false;
+    await user.save();
+    await promptHumanVerification(ctx, user);
+  } else {
+    await user.save();
+  }
+});
+
+bot.action(/postreport_(.+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply("Please select the reason for your complaint:", reportReasonMenu(ctx.match[1]));
+});
+
+bot.action(/prsn_(.+)_(adult|other)/, async (ctx) => {
+  const [, taskId, kind] = ctx.match;
+  const user = await getOrCreateUser(ctx);
+
+  if (kind === "other") {
+    await setSession(user, "awaiting_report_text", { reportTaskId: taskId });
+    await ctx.answerCbQuery();
+    await ctx.reply("✍️ Send a short description of the problem:");
+    return;
+  }
+
+  await recordReport(taskId, user, "Inappropriate content");
+  await ctx.answerCbQuery("Report received");
+  await ctx.reply("✅ Thanks — your report has been recorded.");
+});
+
+// Stores the report, and pauses the task (notifying its owner) once enough
+// different workers have flagged the same post.
+async function recordReport(taskId, user, reason) {
+  await dbConnect();
+  const task = await Task.findById(taskId);
+  if (!task) return;
+  if (task.reports.some((r) => r.telegramId === user.telegramId)) return; // one per worker
+
+  task.reports.push({ telegramId: user.telegramId, reason });
+  task.reportCount = task.reports.length;
+
+  if (task.reportCount >= REPORT_AUTO_PAUSE && task.status === "active") {
+    task.status = "paused";
+    await bot.telegram
+      .sendMessage(
+        task.ownerTelegramId,
+        `⚠️ Your post task "${task.targetChatTitle || task.targetChatId}" was paused after ` +
+          `${task.reportCount} reports from workers. An admin will review it.`
+      )
+      .catch(() => {});
+  }
+
+  await task.save();
+}
 
 bot.action(/verify_(.+)/, async (ctx) => {
   await dbConnect();
@@ -1122,13 +1443,7 @@ async function refreshEarnListInPlace(ctx, task, completingTelegramId) {
     }
 
     const types = EARN_TYPE_MAP[category];
-    const filter = {
-      type: { $in: types },
-      status: "active",
-      ownerTelegramId: { $ne: completingTelegramId },
-      completedBy: { $ne: completingTelegramId },
-      $expr: { $lt: ["$completedCount", "$goalCount"] },
-    };
+    const filter = buildEarnFilter(types, category, completingTelegramId);
 
     const totalCount = await Task.countDocuments(filter);
     if (!totalCount) {
@@ -1378,6 +1693,13 @@ bot.on("text", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   const state = user.sessionState;
   const text = ctx.message.text.trim();
+
+  if (state === "awaiting_report_text") {
+    await recordReport(user.sessionData.reportTaskId, user, text.slice(0, 300));
+    await clearSession(user);
+    await ctx.reply("✅ Thanks — your report has been recorded.", replyMainMenu());
+    return;
+  }
 
   if (state === "awaiting_price") {
     const price = Number(text);
