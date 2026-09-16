@@ -8,6 +8,8 @@ import {
   mainMenu,
   replyMainMenu,
   earnTypeMenu,
+  reactionCategoryMenu,
+  earnRulesMenu,
   subscriberCountMenu,
   cabinetMenu,
   myTasksMenu,
@@ -513,7 +515,34 @@ bot.action("menu_promote", async (ctx) => {
 });
 
 bot.action("menu_earn", async (ctx) => {
-  await ctx.editMessageText("💰 Choose a category to earn coins:", earnTypeMenu());
+  const user = await getOrCreateUser(ctx);
+  const counts = await getEarnCounts(user.telegramId);
+  await ctx.editMessageText("💰 Choose a category to earn coins:", earnTypeMenu(counts));
+});
+
+bot.action("earn_rules", async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(EARN_RULES_TEXT, earnRulesMenu());
+});
+
+bot.action("earn_reactions", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  const { any, fixed } = await getReactionSubCounts(user.telegramId);
+  await ctx.editMessageText(
+    "Select a reaction category.\n" +
+      `Any: ${any}\n` +
+      `Selected: ${fixed}\n\n` +
+      "Any reactions - you can choose for payment.\n\n" +
+      "Selected reactions - the specified reaction must be used for payment.",
+    reactionCategoryMenu()
+  );
+});
+
+bot.action(/reactions_(any|fixed)/, async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  await showEarnList(ctx, user, `reactions${ctx.match[1]}`, 1);
 });
 
 bot.action("menu_cabinet", async (ctx) => {
@@ -1532,7 +1561,73 @@ const ANTI_BOT_CHECK_INTERVAL = 10;
 const MIN_STAY_DAYS = 7;
 const MIN_STAY_MS = MIN_STAY_DAYS * 24 * 60 * 60 * 1000;
 
-const EARN_TYPE_MAP = { sub: ["channel", "group"], views: ["views"], bot: ["bot"] };
+const EARN_TYPE_MAP = {
+  sub: ["channel", "group"],
+  channel: ["channel"],
+  group: ["group"],
+  views: ["views"],
+  bot: ["bot"],
+  boost: ["boost"],
+  reactionsany: ["reactions"],
+  reactionsfixed: ["reactions"],
+};
+
+// Which reactionType a reactions sub-category filters to — see
+// buildEarnFilter, which adds this on top of the normal type filter.
+const REACTION_SUBTYPE = { reactionsany: "any", reactionsfixed: "fixed" };
+
+// The verb shown on each earn-list action button, per category — matches
+// what a worker actually has to do for that task type.
+const EARN_ACTION_LABEL = {
+  sub: "Subscribe",
+  channel: "Subscribe",
+  group: "Subscribe",
+  boost: "Boost",
+  reactionsany: "React",
+  reactionsfixed: "React",
+};
+
+// Live counts for the 💰 Earnings menu — one number per category, using
+// the exact same eligibility rules as the lists themselves (active,
+// not the viewer's own task, not already completed by them).
+async function getEarnCounts(telegramId) {
+  await dbConnect();
+  const categories = ["channel", "group", "views", "bot", "boost"];
+  const [counts, reactions] = await Promise.all([
+    Promise.all(
+      categories.map((cat) =>
+        Task.countDocuments(buildEarnFilter(EARN_TYPE_MAP[cat], cat, telegramId))
+      )
+    ),
+    Task.countDocuments(buildEarnFilter(["reactions"], "reactionsany", telegramId)),
+  ]);
+  const result = { reactions };
+  categories.forEach((cat, i) => (result[cat] = counts[i]));
+  return result;
+}
+
+// Counts for the "Any reactions / Fixed reactions" sub-screen.
+async function getReactionSubCounts(telegramId) {
+  await dbConnect();
+  const [any, fixed] = await Promise.all([
+    Task.countDocuments(buildEarnFilter(["reactions"], "reactionsany", telegramId)),
+    Task.countDocuments(buildEarnFilter(["reactions"], "reactionsfixed", telegramId)),
+  ]);
+  return { any, fixed };
+}
+
+const EARN_RULES_TEXT =
+  "📋 Earning rules\n\n" +
+  "🚫 Forbidden\n" +
+  "• Unsubscribing from channels and chats earlier than 7 days.\n" +
+  "• Removing a placed reaction.\n" +
+  "• Using more than 3 accounts to earn.\n" +
+  "• Cheating on tasks — fake screenshots.\n" +
+  "• Automating tasks with software or other tools.\n\n" +
+  "❓ Penalties for violations\n" +
+  "• Task ban — 7 days.\n" +
+  "• Repeat violation — another 7 days.\n" +
+  "• Unsubscribing forfeits the full amount earned for that task.";
 
 // Resolves the public base URL used to build the WebApp verify link.
 // Priority: explicit PUBLIC_URL env var -> Vercel's stable production
@@ -1589,6 +1684,7 @@ function buildEarnFilter(types, category, telegramId) {
     $expr: { $lt: ["$completedCount", "$goalCount"] },
   };
   if (category === "views") filter.targetMessageId = { $exists: true, $ne: null };
+  if (REACTION_SUBTYPE[category]) filter.reactionType = REACTION_SUBTYPE[category];
   return filter;
 }
 
@@ -1601,7 +1697,8 @@ async function showEarnList(ctx, user, category, page = 1) {
 
   const totalCount = await Task.countDocuments(filter);
   if (!totalCount) {
-    await sendOrReplace(ctx, "No available tasks right now. Check back later!", earnTypeMenu());
+    const counts = await getEarnCounts(user.telegramId);
+    await sendOrReplace(ctx, "No available tasks right now. Check back later!", earnTypeMenu(counts));
     return;
   }
 
@@ -1613,23 +1710,24 @@ async function showEarnList(ctx, user, category, page = 1) {
     .skip((safePage - 1) * EARN_PAGE_SIZE)
     .limit(EARN_PAGE_SIZE);
 
+  const actionLabel = EARN_ACTION_LABEL[category] || "Subscribe";
   await sendOrReplace(
     ctx,
     category === "views"
       ? `👁 Post tasks — tap a post to view it and get paid instantly.\n\n` +
           `⚠️ Attention! Some posts are long — scroll them up and down.`
-      : `${TYPE_LABELS[types[0]]} tasks — tap Subscribe to open it, then Check to get paid.`,
+      : `${TYPE_LABELS[types[0]]} tasks — tap ${actionLabel} to open it, then Check to get paid.`,
     earnTaskListMenu(tasks, category, safePage, totalPages)
   );
 }
 
-bot.action(/earn_(sub|views|bot)/, async (ctx) => {
+bot.action(/earn_(sub|channel|group|views|bot|boost)/, async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await ctx.answerCbQuery();
   await showEarnList(ctx, user, ctx.match[1], 1);
 });
 
-bot.action(/earnpage_(sub|views|bot)_(\d+)/, async (ctx) => {
+bot.action(/earnpage_(sub|channel|group|views|bot|boost|reactionsany|reactionsfixed)_(\d+)/, async (ctx) => {
   const user = await getOrCreateUser(ctx);
   const [, category, pageStr] = ctx.match;
   await ctx.answerCbQuery();
@@ -1652,7 +1750,7 @@ bot.action(/earnpage_(sub|views|bot)_(\d+)/, async (ctx) => {
   }
 });
 
-bot.action(/earnreport_(sub|views|bot)_(\d+)/, async (ctx) => {
+bot.action(/earnreport_(sub|channel|group|views|bot|boost|reactionsany|reactionsfixed)_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery(
     "To report a task, contact support with its link — thanks for flagging it!",
     { show_alert: true }
@@ -1934,14 +2032,19 @@ bot.action(/verify_(.+)/, async (ctx) => {
 async function refreshEarnListInPlace(ctx, task, completingTelegramId) {
   try {
     await dbConnect();
-    const category = task.type === "views" ? "views" : task.type === "bot" ? "bot" : "sub";
+    const category =
+      task.type === "reactions"
+        ? task.reactionType === "fixed"
+          ? "reactionsfixed"
+          : "reactionsany"
+        : task.type;
 
     // The current page is always the 3rd button of the pagination row
     // (["1", "<", `${page}`, ">", `${totalPages}`]) — see earnTaskListMenu.
     let page = 1;
     const rows = ctx.callbackQuery?.message?.reply_markup?.inline_keyboard || [];
     for (const row of rows) {
-      const match = row[2]?.callback_data?.match(/^earnpage_(?:sub|views|bot)_(\d+)$/);
+      const match = row[2]?.callback_data?.match(/^earnpage_[a-z]+_(\d+)$/);
       if (match) {
         page = Number(match[1]);
         break;
@@ -1953,7 +2056,8 @@ async function refreshEarnListInPlace(ctx, task, completingTelegramId) {
 
     const totalCount = await Task.countDocuments(filter);
     if (!totalCount) {
-      await ctx.editMessageText("No available tasks right now. Check back later!", earnTypeMenu());
+      const counts = await getEarnCounts(completingTelegramId);
+      await ctx.editMessageText("No available tasks right now. Check back later!", earnTypeMenu(counts));
       return;
     }
 
@@ -2109,7 +2213,8 @@ bot.hears("📢 Promote", async (ctx) => {
 bot.hears("💰 Earnings", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await tryDeleteUserMessage(ctx);
-  await sendClean(ctx, user, "💰 Choose a category to earn coins:", earnTypeMenu());
+  const counts = await getEarnCounts(user.telegramId);
+  await sendClean(ctx, user, "💰 Choose a category to earn coins:", earnTypeMenu(counts));
 });
 
 bot.hears("👤 My Cabinet", async (ctx) => {

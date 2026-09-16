@@ -22,6 +22,18 @@ const TaskSchema = new mongoose.Schema(
       required: true,
     },
 
+    // For "reactions" tasks only: whether the worker may react with any
+    // emoji ("any") or must use the one specific emoji the owner picked
+    // ("fixed") — mirrors the "Any reactions / Fixed reactions" choice
+    // shown when a worker opens the ❤️ Reactions earn category.
+    reactionType: {
+      type: String,
+      enum: ["any", "fixed"],
+      default: "any",
+    },
+    // The specific emoji required when reactionType is "fixed".
+    fixedReactionEmoji: { type: String },
+
     // Telegram chat id / username of the channel or group being promoted
     targetChatId: { type: String, required: true },
     targetChatTitle: String,
