@@ -21,43 +21,13 @@ export const replyMainMenu = () =>
 // (The old inline promoteTypeMenu was replaced by promoteTypeReplyMenu
 // below — the real app uses a persistent reply keyboard for this step.)
 
-// Matches the PR GRAM-style earn menu exactly: one two-column grid of
-// category buttons, each showing how many active tasks are available
-// right now, then Rules and Back. `counts` is
-// { channel, group, views, bot, reactions, boost } — all numbers.
-export const earnTypeMenu = (counts = {}) => {
-  const c = (k) => counts[k] ?? 0;
-  return Markup.inlineKeyboard([
-    [
-      Markup.button.callback(`📢 Channels · ${c("channel")}`, "earn_channel"),
-      Markup.button.callback(`👥 Groups · ${c("group")}`, "earn_group"),
-    ],
-    [
-      Markup.button.callback(`👁 Views · ${c("views")}`, "earn_views"),
-      Markup.button.callback(`🤖 Bots · ${c("bot")}`, "earn_bot"),
-    ],
-    [
-      Markup.button.callback(`❤️ Reactions · ${c("reactions")}`, "earn_reactions"),
-      Markup.button.callback(`⚡️ Boost · ${c("boost")}`, "earn_boost"),
-    ],
-    [Markup.button.callback("📋 Rules", "earn_rules")],
+export const earnTypeMenu = () =>
+  Markup.inlineKeyboard([
+    [Markup.button.callback("👥 Subscribe (Channel/Group)", "earn_sub")],
+    [Markup.button.callback("👀 Views", "earn_views")],
+    [Markup.button.callback("🤖 Bots", "earn_bot")],
     [Markup.button.callback("⬅️ Back", "menu_main")],
   ]);
-};
-
-// The "Select a reaction category" sub-screen shown after tapping
-// ❤️ Reactions — mirrors the real app's "Any reactions / Fixed reactions"
-// choice. `counts` is { any, fixed }.
-export const reactionCategoryMenu = () =>
-  Markup.inlineKeyboard([
-    [Markup.button.callback("Any reactions", "reactions_any")],
-    [Markup.button.callback("⭐ Fixed reactions", "reactions_fixed")],
-    [Markup.button.callback("⬅️ Back", "menu_earn")],
-  ]);
-
-// The 📋 Rules screen reached from the earn menu.
-export const earnRulesMenu = () =>
-  Markup.inlineKeyboard([[Markup.button.callback("⬅️ Back", "menu_earn")]]);
 
 export const subscriberCountMenu = () =>
   Markup.inlineKeyboard([
@@ -207,19 +177,7 @@ export const backToTaskMenu = (taskId) =>
 // to open and no membership to check. Tapping the button makes the bot
 // forward the promoted post straight into this chat and pay immediately,
 // so it's a single callback button per task (matching "👁 View Post +N GRAM").
-// Verb shown on each row's action button — matches what a worker has to
-// actually do for that task type (Subscribe / Boost / React).
-const EARN_ROW_ACTION_LABEL = {
-  sub: "Subscribe",
-  channel: "Subscribe",
-  group: "Subscribe",
-  boost: "Boost",
-  reactionsany: "React",
-  reactionsfixed: "React",
-};
-
 export const earnTaskListMenu = (tasks, category, page, totalPages) => {
-  const actionLabel = EARN_ROW_ACTION_LABEL[category] || "Subscribe";
   const rows =
     category === "views"
       ? tasks.map((t) => [
@@ -230,7 +188,7 @@ export const earnTaskListMenu = (tasks, category, page, totalPages) => {
         ])
       : tasks.map((t) => [
           Markup.button.url(
-            `💲 +${t.pricePerAction} | ${actionLabel}`,
+            `💲 +${t.pricePerAction} | Subscribe`,
             t.targetInviteLink || "https://t.me"
           ),
           Markup.button.callback("🔄 Check", `verify_${t._id}`),
