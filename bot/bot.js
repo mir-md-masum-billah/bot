@@ -172,6 +172,10 @@ async function creditOwnerReclaimed(ownerTelegramId, amount, relatedTaskId) {
 // Spend: donated balance first, then earned balance (commission applies
 // only to the portion paid from earned/non-donated coins).
 async function spendForTask(user, totalCost) {
+  if (!Number.isFinite(totalCost) || totalCost <= 0) {
+    console.error(`spendForTask: refusing non-finite/invalid totalCost (${totalCost}) for user ${user.telegramId}`);
+    return { ok: false, needed: 0, invalid: true };
+  }
   let fromDonated = Math.min(user.donatedBalance, totalCost);
   let fromEarned = totalCost - fromDonated;
   let commission = 0;
@@ -615,6 +619,11 @@ bot.hears("✅ Publish Task", async (ctx) => {
 async function proceedToPayment(ctx, user, count) {
   const totalGram = user.sessionData.price * count;
   const available = user.donatedBalance + user.earnedBalance;
+  if (!Number.isFinite(totalGram)) {
+    await clearSession(user);
+    await ctx.reply("⚠️ Something went wrong with your task details. Please start over.", mainMenu());
+    return;
+  }
   if (available < totalGram) {
     await ctx.reply(
       `❌ Insufficient balance for that many. Max you can afford: ` +
@@ -648,7 +657,12 @@ async function createWizardTask(ctx, user, paymentMethod) {
   if (paymentMethod === "gram") {
     const spend = await spendForTask(user, totalGram);
     if (!spend.ok) {
-      await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} GRAM.`);
+      if (spend.invalid) {
+        await clearSession(user);
+        await ctx.reply("⚠️ Something went wrong with your task details. Please start over.", mainMenu());
+      } else {
+        await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} GRAM.`);
+      }
       return;
     }
     commission = spend.commission;
@@ -1484,6 +1498,12 @@ async function finalizeCount(ctx, user, count) {
   const totalCost = price * count;
   const available = user.donatedBalance + user.earnedBalance;
 
+  if (!Number.isFinite(totalCost)) {
+    await clearSession(user);
+    await ctx.reply("⚠️ Something went wrong with your task details. Please start over.", mainMenu());
+    return;
+  }
+
   if (available < totalCost) {
     await clearSession(user);
     await ctx.reply(
@@ -1540,7 +1560,12 @@ async function handleChatInput(ctx, user, message) {
   const { type, price, count } = user.sessionData;
   const spend = await spendForTask(user, price * count);
   if (!spend.ok) {
-    await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} coins.`);
+    if (spend.invalid) {
+      await clearSession(user);
+      await ctx.reply("⚠️ Something went wrong with your task details. Please start over.", mainMenu());
+    } else {
+      await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} coins.`);
+    }
     return;
   }
 
