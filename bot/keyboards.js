@@ -227,12 +227,26 @@ export const languageMenu = (selected = []) => {
   return Markup.keyboard(rows).resize();
 };
 
-export const countMenu = (maxForBalance) =>
-  Markup.keyboard([
-    [`${maxForBalance} (Maximum for your balance)`],
-    ["✏️ Custom amount"],
-    ["⬅️ Back"],
-  ]).resize();
+// Five balance-based choices (1/5, 2/5, 3/5, 4/5 and the full maximum the
+// user can afford) plus a free-text option, so the common case is one tap
+// and nobody has to work out what their balance covers.
+export const countMenu = (maxForBalance) => {
+  const fractions = [1, 2, 3, 4]
+    .map((part) => Math.floor((maxForBalance * part) / 5))
+    .filter((n, i, arr) => n >= 1 && arr.indexOf(n) === i && n < maxForBalance)
+    .map(String);
+
+  const rows = [];
+  if (fractions.length) rows.push(fractions);
+  rows.push([`${maxForBalance} (Maximum for your balance)`]);
+  rows.push(["✏️ Custom amount"]);
+  rows.push(["⬅️ Back"]);
+  return Markup.keyboard(rows).resize();
+};
+
+// The price step takes a typed number, so the audience buttons from the
+// previous step must not stay on screen — this replaces them.
+export const priceInputMenu = () => Markup.keyboard([["⬅️ Back"]]).resize();
 
 export const paymentMethodMenu = (gramCost, starsCost) =>
   Markup.keyboard([

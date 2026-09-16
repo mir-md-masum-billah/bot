@@ -19,6 +19,7 @@ import {
   languageMenu,
   LANGUAGES,
   countMenu,
+  priceInputMenu,
   paymentMethodMenu,
   joinRequestConfirmMenu,
   publishConfirmMenu,
@@ -213,6 +214,38 @@ async function spendForTask(user, totalCost) {
   }
 
   return { ok: true, commission };
+}
+
+// Every inline-button tap replaces the message it came from instead of
+// stacking a new one underneath: the old menu is deleted, then the new one
+// is sent. That keeps the freshest buttons at the bottom of the chat (right
+// where the user's thumb is) and stops the same list appearing three times.
+// Deleting is used rather than editing because a viewed post is forwarded
+// *between* the two menus — an edited-in-place menu would be left stranded
+// above the post the user just opened.
+async function sendOrReplace(ctx, text, extra) {
+  if (ctx.callbackQuery?.message) {
+    await ctx.deleteMessage().catch(() => {});
+  }
+  return ctx.reply(text, extra);
+}
+
+// Largest number of completions the user can actually pay for, commission
+// included. Commission only applies to the part paid from earned coins
+// (see spendForTask), so this walks down from the naive ceiling until the
+// real cost fits — at most a couple of iterations.
+function maxAffordable(user, price) {
+  const available = user.donatedBalance + user.earnedBalance;
+  if (!Number.isFinite(price) || price <= 0) return 1;
+  let n = Math.floor(available / price);
+  while (n > 1) {
+    const gross = price * n;
+    const fromEarned = Math.max(0, gross - user.donatedBalance);
+    const commission = Math.ceil((fromEarned * COMMISSION_PERCENT) / 100);
+    if (gross + commission <= available) break;
+    n -= 1;
+  }
+  return Math.max(1, n);
 }
 
 async function isBotAdminIn(chatId) {
@@ -491,18 +524,20 @@ async function renderWizardStep(ctx, user, state) {
         `💲 Set the price for 1 ${unit} — this is the worker's reward.\n\n` +
           `Minimum — ${min} GRAM\n` +
           `💡 Recommended — ${min + RECOMMENDED_SURCHARGE} GRAM\n` +
-          `Completion speed depends on your price.`
+          `Completion speed depends on your price.`,
+        priceInputMenu()
       );
       return;
     }
     case "wizard_choosing_count": {
       const total = user.donatedBalance + user.earnedBalance;
-      const maxForBalance = Math.max(1, Math.floor(total / d.price));
+      const maxForBalance = maxAffordable(user, d.price);
       const unit = d.type === "views" ? "views" : "subscriptions";
       await ctx.reply(
-        `🧾 Enter the number of ${unit} or choose:\n` +
+        `ℹ️ Task creation commission — ${COMMISSION_PERCENT}%.\n\n` +
           `💵 ${d.type === "views" ? "View" : "Subscription"} price — ${d.price} GRAM\n` +
-          `💰 Your balance — ${total.toLocaleString()} GRAM`,
+          `💰 Your balance — ${total.toLocaleString()} GRAM\n\n` +
+          `📝 Enter the number of ${unit} or choose:`,
         countMenu(maxForBalance)
       );
       return;
@@ -776,10 +811,11 @@ async function proceedToPayment(ctx, user, count) {
     await ctx.reply("⚠️ Something went wrong with your task details. Please start over.", mainMenu());
     return;
   }
-  if (available < totalGram) {
+  const affordable = maxAffordable(user, user.sessionData.price);
+  if (available < totalGram || count > affordable) {
     await ctx.reply(
-      `❌ Insufficient balance for that many. Max you can afford: ` +
-        `${Math.max(1, Math.floor(available / user.sessionData.price))}.`
+      `❌ Insufficient balance for that many (commission included). ` +
+        `Max you can afford: ${affordable}.`
     );
     return;
   }
@@ -1107,7 +1143,7 @@ async function showEarnList(ctx, user, category, page = 1) {
 
   const totalCount = await Task.countDocuments(filter);
   if (!totalCount) {
-    await ctx.reply("No available tasks right now. Check back later!", earnTypeMenu());
+    await sendOrReplace(ctx, "No available tasks right now. Check back later!", earnTypeMenu());
     return;
   }
 
@@ -1119,7 +1155,8 @@ async function showEarnList(ctx, user, category, page = 1) {
     .skip((safePage - 1) * EARN_PAGE_SIZE)
     .limit(EARN_PAGE_SIZE);
 
-  await ctx.reply(
+  await sendOrReplace(
+    ctx,
     category === "views"
       ? `👁 Post tasks — tap a post to view it and get paid instantly.\n\n` +
           `⚠️ Attention! Some posts are long — scroll them up and down.`
@@ -1254,14 +1291,17 @@ bot.action(/viewpost_(.+)/, async (ctx) => {
   const postNumber = await nextCounterValue("completions", 800000);
   const balance = user.donatedBalance + user.earnedBalance;
   await ctx.answerCbQuery("✅ Paid!");
-  await ctx.reply(
+  // The old task list is deleted here rather than refreshed in place: the
+  // post was just forwarded below it, so the reward + "Next Post" buttons
+  // belong underneath the post, not stranded above it. Tapping Next Post
+  // rebuilds the list from the DB, which no longer contains this task.
+  await sendOrReplace(
+    ctx,
     `💲 You earned +${updatedTask.pricePerAction.toLocaleString()} GRAM for viewing post ` +
       `#${postNumber.toLocaleString()}!\n` +
       `💰 Your balance: ${balance.toLocaleString()} GRAM`,
     afterViewMenu(updatedTask._id.toString())
   );
-
-  await refreshEarnListInPlace(ctx, updatedTask, user.telegramId);
 
   user.totalTasksCompleted += 1;
   user.tasksSinceVerification += 1;
@@ -1278,7 +1318,11 @@ bot.action(/viewpost_(.+)/, async (ctx) => {
 
 bot.action(/postreport_(.+)/, async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply("Please select the reason for your complaint:", reportReasonMenu(ctx.match[1]));
+  await sendOrReplace(
+    ctx,
+    "Please select the reason for your complaint:",
+    reportReasonMenu(ctx.match[1])
+  );
 });
 
 bot.action(/prsn_(.+)_(adult|other)/, async (ctx) => {
@@ -1288,13 +1332,20 @@ bot.action(/prsn_(.+)_(adult|other)/, async (ctx) => {
   if (kind === "other") {
     await setSession(user, "awaiting_report_text", { reportTaskId: taskId });
     await ctx.answerCbQuery();
-    await ctx.reply("✍️ Send a short description of the problem:");
+    await sendOrReplace(ctx, "✍️ Send a short description of the problem:");
     return;
   }
 
   await recordReport(taskId, user, "Inappropriate content");
   await ctx.answerCbQuery("Report received");
-  await ctx.reply("✅ Thanks — your report has been recorded.");
+  await sendOrReplace(
+    ctx,
+    "✅ Thanks — your report has been recorded.",
+    Markup.inlineKeyboard([
+      [Markup.button.callback("➡️ Next Post", "earn_views")],
+      [Markup.button.callback("⬅️ Back", "menu_earn")],
+    ])
+  );
 });
 
 // Stores the report, and pauses the task (notifying its owner) once enough
@@ -1697,7 +1748,13 @@ bot.on("text", async (ctx) => {
   if (state === "awaiting_report_text") {
     await recordReport(user.sessionData.reportTaskId, user, text.slice(0, 300));
     await clearSession(user);
-    await ctx.reply("✅ Thanks — your report has been recorded.", replyMainMenu());
+    await ctx.reply(
+      "✅ Thanks — your report has been recorded.",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("➡️ Next Post", "earn_views")],
+        [Markup.button.callback("⬅️ Back", "menu_earn")],
+      ])
+    );
     return;
   }
 
@@ -1771,16 +1828,17 @@ bot.on("text", async (ctx) => {
   }
 
   if (state === "wizard_choosing_count") {
-    const total = user.donatedBalance + user.earnedBalance;
-    const maxForBalance = Math.max(1, Math.floor(total / user.sessionData.price));
     if (text === "✏️ Custom amount") {
       await goForward(user, "wizard_awaiting_custom_count", {});
       await renderWizardStep(ctx, user, "wizard_awaiting_custom_count");
       return;
     }
-    const tappedMax = parseInt(text, 10);
-    if (text.endsWith("(Maximum for your balance)") && tappedMax === maxForBalance) {
-      await proceedToPayment(ctx, user, maxForBalance);
+    // Covers the "(Maximum for your balance)" button, the four
+    // balance-fraction buttons, and anything typed by hand — they all
+    // arrive as text, and proceedToPayment re-checks affordability anyway.
+    const tapped = parseInt(text, 10);
+    if (Number.isFinite(tapped) && tapped > 0) {
+      await proceedToPayment(ctx, user, tapped);
       return;
     }
     await ctx.reply('Tap a button below, or use "✏️ Custom amount" to type a number.');
