@@ -44,22 +44,129 @@ export const subscriberCountMenu = () =>
     [Markup.button.callback("⬅️ Back", "menu_promote")],
   ]);
 
-export const cabinetMenu = () =>
+// ---------- 👤 My Cabinet ----------
+// Mirrors the PR GRAM cabinet screen: one full-width inline button per row,
+// with the notification row reflecting the user's current setting.
+export const cabinetMenu = (user = {}) =>
   Markup.inlineKeyboard([
+    [Markup.button.callback("💳 Replenish Balance", "cab_replenish")],
+    [Markup.button.callback("👥 Referral System", "cab_referral")],
+    [Markup.button.callback("📈 Level System", "cab_levels")],
     [Markup.button.callback("📋 My Tasks", "cabinet_tasks")],
+    [Markup.button.callback("🌐 Change Language", "cab_language")],
+    [
+      user.notificationsEnabled === false
+        ? Markup.button.callback("🔔 Enable notifications", "cab_notif_on")
+        : Markup.button.callback("❌ Disable notifications", "cab_notif_off"),
+    ],
     [Markup.button.callback("⬅️ Back", "menu_main")],
   ]);
 
-export const taskManageMenu = (taskId, status) =>
-  Markup.inlineKeyboard([
-    [
-      status === "active"
-        ? Markup.button.callback("⏸ Pause", `task_pause_${taskId}`)
-        : Markup.button.callback("▶️ Resume", `task_resume_${taskId}`),
-      Markup.button.callback("🗑 Delete", `task_delete_${taskId}`),
-    ],
-    [Markup.button.callback("⬅️ Back to list", "cabinet_tasks")],
+// Status icon shown in front of every task row and in the task header.
+export const TASK_STATUS_ICON = {
+  active: "▶️",
+  paused: "⏸",
+  completed: "✅",
+};
+
+const TASK_TYPE_ICON = {
+  channel: "📢",
+  group: "👥",
+  views: "👁",
+  bot: "🤖",
+  boost: "⚡️",
+  reactions: "❤️",
+};
+
+// One compact row per task — "▶️ 👥 3 - 1000 💰" (status, type, goal,
+// price) — then the status filter row, exactly like the real app's list.
+export const myTasksMenu = (tasks, filter = "active") => {
+  const rows = tasks.map((t) => [
+    Markup.button.callback(
+      `${TASK_STATUS_ICON[t.status] || "▶️"} ${TASK_TYPE_ICON[t.type] || "📋"} ` +
+        `${t.goalCount} - ${t.pricePerAction} 💰`,
+      `taskdet_${t._id}`
+    ),
   ]);
+
+  // The active filter is marked so the list never looks identical between
+  // tabs when one of them happens to be empty.
+  const tab = (label, value) =>
+    Markup.button.callback(filter === value ? `• ${label} •` : label, `tasklist_${value}`);
+
+  rows.push([tab("In progress", "active"), tab("Finished", "completed"), tab("Paused", "paused")]);
+  rows.push([Markup.button.callback("➕ Create New Task", "menu_promote")]);
+  rows.push([Markup.button.callback("⬅️ Back", "menu_cabinet")]);
+  return Markup.inlineKeyboard(rows);
+};
+
+// The single-task management screen.
+export const taskDetailMenu = (task) => {
+  const id = task._id.toString();
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("➕ Add Execution", `task_add_${id}`)],
+    [
+      task.status === "active"
+        ? Markup.button.callback("⏸ Pause", `task_pause_${id}`)
+        : Markup.button.callback("▶️ Resume", `task_resume_${id}`),
+      Markup.button.callback("🗑 Delete", `task_delete_${id}`),
+    ],
+    [Markup.button.callback("✏️ Change Price", `task_price_${id}`)],
+    [
+      Markup.button.callback(
+        `👤 Account type: ${task.audienceMode === "premium_only" ? "Premium only" : "All users"}`,
+        `task_acct_${id}`
+      ),
+    ],
+    [
+      Markup.button.callback(
+        `🌐 Audience: ${task.languages?.length ? `${task.languages.length} language(s)` : "All users"}`,
+        `task_aud_${id}`
+      ),
+    ],
+    [
+      task.notifyOwner === false
+        ? Markup.button.callback("🔔 Enable notification", `task_notif_${id}_on`)
+        : Markup.button.callback("❌ Disable notification", `task_notif_${id}_off`),
+    ],
+    [Markup.button.callback("🔄 Refresh Invite Link", `task_link_${id}`)],
+    [Markup.button.callback("⬅️ Back", "cabinet_tasks")],
+  ]);
+};
+
+// Confirmation step for Delete — a mis-tap here refunds and kills a paid
+// task, so it never fires straight from the detail screen.
+export const taskDeleteConfirmMenu = (taskId) =>
+  Markup.inlineKeyboard([
+    [Markup.button.callback("🗑 Yes, delete it", `task_delconf_${taskId}`)],
+    [Markup.button.callback("⬅️ No, keep it", `taskdet_${taskId}`)],
+  ]);
+
+// Inline language multi-select. Used both for the cabinet's interface
+// language (single pick, prefix "cablang_") and for a task's audience
+// filter (multi pick, prefix "taskaud_") — the caller supplies the prefix.
+export const languagePickMenu = (prefix, selected = [], doneAction, multi = true) => {
+  const rows = [];
+  for (let i = 0; i < LANGUAGES.length; i += 2) {
+    rows.push(
+      LANGUAGES.slice(i, i + 2).map((l) =>
+        Markup.button.callback(
+          `${multi && selected.includes(l.code) ? "✅ " : ""}${l.label}`,
+          `${prefix}${l.code}`
+        )
+      )
+    );
+  }
+  if (multi) rows.push([Markup.button.callback("☑️ Save", doneAction)]);
+  else rows.push([Markup.button.callback("⬅️ Back", doneAction)]);
+  return Markup.inlineKeyboard(rows);
+};
+
+export const backToCabinetMenu = () =>
+  Markup.inlineKeyboard([[Markup.button.callback("⬅️ Back", "menu_cabinet")]]);
+
+export const backToTaskMenu = (taskId) =>
+  Markup.inlineKeyboard([[Markup.button.callback("⬅️ Back", `taskdet_${taskId}`)]]);
 
 // (earnActionMenu removed — replaced by the paginated earnTaskListMenu below)
 // ---------- earn task list (channels/groups/etc, paginated) ----------

@@ -15,6 +15,18 @@ const UserSchema = new mongoose.Schema(
     hasDonatedEver: { type: Boolean, default: false },
 
     referredBy: { type: Number, default: null },
+
+    // Level system (PR GRAM-style "🐣 Novice 66/500 XP"). XP is awarded for
+    // every completed earn-task; the level itself is derived from xp at
+    // display time (see LEVELS in bot.js), never stored, so the thresholds
+    // can be retuned later without a migration.
+    xp: { type: Number, default: 0 },
+
+    // Interface language chosen in 👤 My Cabinet → 🌐 Change Language.
+    language: { type: String, default: "en" },
+
+    // Master switch for bot notifications (task finished, report, clawback).
+    notificationsEnabled: { type: Boolean, default: true },
     isBanned: { type: Boolean, default: false },
 
     // Anti-bot "human verification" (drag-puzzle captcha). Users start

@@ -10,7 +10,13 @@ import {
   earnTypeMenu,
   subscriberCountMenu,
   cabinetMenu,
-  taskManageMenu,
+  myTasksMenu,
+  taskDetailMenu,
+  taskDeleteConfirmMenu,
+  languagePickMenu,
+  backToCabinetMenu,
+  backToTaskMenu,
+  TASK_STATUS_ICON,
   promoteTypeReplyMenu,
   adminStatusReplyMenu,
   linkTypeMenu,
@@ -51,6 +57,39 @@ function computeMinPrice(audienceMode, languages) {
   let min = audienceMode === "premium_only" ? PREMIUM_MIN_PRICE : BASE_MIN_PRICE;
   if (languages && languages.length > 0) min += LANGUAGE_FILTER_SURCHARGE;
   return min;
+}
+
+// ---------- level system ----------
+// XP is only ever awarded by creditEarned (one completed task = XP_PER_TASK),
+// and the level is derived from the total at display time, so thresholds can
+// be retuned here without touching any stored data.
+const XP_PER_TASK = 10;
+const LEVELS = [
+  { name: "Novice", icon: "🐣", upTo: 500 },
+  { name: "Worker", icon: "🐤", upTo: 2000 },
+  { name: "Expert", icon: "🦅", upTo: 10000 },
+  { name: "Master", icon: "🐉", upTo: Infinity },
+];
+
+function levelFor(xp = 0) {
+  let floor = 0;
+  for (const lvl of LEVELS) {
+    if (xp < lvl.upTo) {
+      return {
+        ...lvl,
+        into: xp - floor,
+        span: lvl.upTo === Infinity ? null : lvl.upTo - floor,
+      };
+    }
+    floor = lvl.upTo;
+  }
+  const last = LEVELS[LEVELS.length - 1];
+  return { ...last, into: xp, span: null };
+}
+
+function levelLabel(user) {
+  const l = levelFor(user.xp || 0);
+  return l.span ? `${l.icon}${l.name} ${l.into}/${l.span} XP` : `${l.icon}${l.name} ${l.into} XP`;
 }
 
 function gramToStars(totalGram) {
@@ -131,12 +170,28 @@ async function clearSession(user) {
   await user.save();
 }
 
+// Sends a task-owner alert unless they muted it — either for this one task
+// (👤 detail screen → Disable notification) or globally (cabinet → Disable
+// notifications). Never throws: a blocked bot must not break the caller.
+async function notifyTaskOwner(task, text) {
+  try {
+    if (task.notifyOwner === false) return;
+    const owner = await User.findOne({ telegramId: task.ownerTelegramId });
+    if (owner && owner.notificationsEnabled === false) return;
+    await bot.telegram.sendMessage(task.ownerTelegramId, text);
+  } catch (e) {
+    // Owner blocked the bot / chat not found — nothing to do.
+  }
+}
+
 async function creditEarned(user, amount, note, relatedTaskId) {
   if (!Number.isFinite(amount)) {
     console.error(`creditEarned: refusing non-finite amount (${amount}) for user ${user.telegramId}, task ${relatedTaskId}`);
     return;
   }
   user.earnedBalance += amount;
+  // Every paid completion also moves the level bar in 👤 My Cabinet.
+  user.xp = (user.xp || 0) + XP_PER_TASK;
   await user.save();
   await Transaction.create({
     telegramId: user.telegramId,
@@ -382,6 +437,19 @@ async function tryDeleteUserMessage(ctx) {
 
 bot.start(async (ctx) => {
   const user = await getOrCreateUser(ctx);
+  // "?start=ref_<id>" from 👤 My Cabinet → Referral System. Only ever set
+  // once, and never to the user's own id.
+  const payload = ctx.startPayload || "";
+  if (!user.referredBy && payload.startsWith("ref_")) {
+    const inviter = Number(payload.slice(4));
+    if (Number.isFinite(inviter) && inviter !== user.telegramId) {
+      const exists = await User.exists({ telegramId: inviter });
+      if (exists) {
+        user.referredBy = inviter;
+        await user.save();
+      }
+    }
+  }
   await clearSession(user);
   await tryDeleteUserMessage(ctx);
   await sendClean(
@@ -435,7 +503,9 @@ bot.action("menu_earn", async (ctx) => {
 });
 
 bot.action("menu_cabinet", async (ctx) => {
-  await ctx.editMessageText("🗂 My Cabinet", cabinetMenu());
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  await showCabinet(ctx, user);
 });
 
 // ---------- promote flow ----------
@@ -888,6 +958,7 @@ async function createWizardTask(ctx, user, paymentMethod) {
 
   await Task.create({
     ownerTelegramId: user.telegramId,
+    taskNumber: await nextCounterValue("tasks", 1888000),
     type: d.type,
     targetChatId: d.targetChatId,
     targetChatTitle: d.targetChatTitle,
@@ -992,27 +1063,127 @@ bot.hears("⬅️ Back", async (ctx) => {
   await renderWizardStep(ctx, user, prevState);
 });
 
-async function showMyTasks(ctx, user) {
+// ---------- 👤 My Cabinet ----------
+
+// The cabinet header — id, level bar and balance — exactly the three lines
+// the real app shows above the cabinet buttons.
+function cabinetText(user) {
+  const total = user.donatedBalance + user.earnedBalance;
+  return (
+    `👤 Your Cabinet:\n\n` +
+    `🆔 My ID: ${user.telegramId}\n` +
+    `📈 Level: ${levelLabel(user)}\n` +
+    `💲 Balance: ${total.toLocaleString()} GRAM`
+  );
+}
+
+async function showCabinet(ctx, user) {
+  await sendOrReplace(ctx, cabinetText(user), cabinetMenu(user));
+}
+
+bot.action("cab_replenish", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  await sendOrReplace(
+    ctx,
+    `💳 Replenish Balance\n\n` +
+      `Top-ups are handled with Telegram Stars during task creation: pick ` +
+      `⭐ Stars at the payment step and the task is paid for directly.\n\n` +
+      `A standalone "buy GRAM" purchase isn't wired up in this build — ` +
+      `contact the admin to credit your balance manually.`,
+    backToCabinetMenu()
+  );
+});
+
+bot.action("cab_referral", async (ctx) => {
+  await dbConnect();
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  if (!cachedBotUsername) cachedBotUsername = (await bot.telegram.getMe()).username;
+  const invited = await User.countDocuments({ referredBy: user.telegramId });
+  await sendOrReplace(
+    ctx,
+    `👥 Referral System\n\n` +
+      `🔗 Your link:\nhttps://t.me/${cachedBotUsername}?start=ref_${user.telegramId}\n\n` +
+      `👤 Invited: ${invited}\n\n` +
+      `Share the link — anyone who starts the bot through it is permanently ` +
+      `tied to your account.`,
+    backToCabinetMenu()
+  );
+});
+
+bot.action("cab_levels", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  const lines = LEVELS.map((l, i) => {
+    const from = i === 0 ? 0 : LEVELS[i - 1].upTo;
+    const range = l.upTo === Infinity ? `${from}+ XP` : `${from}–${l.upTo} XP`;
+    return `${l.icon} ${l.name} — ${range}`;
+  }).join("\n");
+  await sendOrReplace(
+    ctx,
+    `📈 Level System\n\n` +
+      `You earn ${XP_PER_TASK} XP for every task you complete.\n\n` +
+      `${lines}\n\n` +
+      `Your level: ${levelLabel(user)}`,
+    backToCabinetMenu()
+  );
+});
+
+bot.action("cab_language", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  const current = LANGUAGES.find((l) => l.code === user.language);
+  await sendOrReplace(
+    ctx,
+    `🌐 Change Language\n\nCurrent: ${current ? current.label : user.language}`,
+    languagePickMenu("cablang_", [], "menu_cabinet", false)
+  );
+});
+
+bot.action(/cablang_(.+)/, async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  const code = ctx.match[1];
+  const lang = LANGUAGES.find((l) => l.code === code);
+  user.language = code;
+  await user.save();
+  await ctx.answerCbQuery(lang ? `Language: ${lang.label}` : "Saved");
+  // NOTE: this only records the preference. Bot texts are English-only in
+  // this build — translate them with this field to make it take effect.
+  await showCabinet(ctx, user);
+});
+
+bot.action(/cab_notif_(on|off)/, async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  user.notificationsEnabled = ctx.match[1] === "on";
+  await user.save();
+  await ctx.answerCbQuery(user.notificationsEnabled ? "🔔 Notifications on" : "🔕 Notifications off");
+  await showCabinet(ctx, user);
+});
+
+// ---------- 📋 My Tasks ----------
+
+const TASK_FILTERS = {
+  active: { label: "In progress", status: "active" },
+  completed: { label: "Finished", status: "completed" },
+  paused: { label: "Paused", status: "paused" },
+};
+
+async function showMyTasks(ctx, user, filter = "active") {
   await dbConnect();
   const tasks = await Task.find({
     ownerTelegramId: user.telegramId,
-    status: { $ne: "deleted" },
-  }).sort({ createdAt: -1 });
+    status: TASK_FILTERS[filter]?.status || "active",
+  })
+    .sort({ createdAt: -1 })
+    .limit(20);
 
-  if (!tasks.length) {
-    await ctx.reply("You have no tasks yet.", cabinetMenu());
-    return;
-  }
+  const header = `📋 Manage your tasks — ${TASK_FILTERS[filter]?.label || "In progress"}`;
+  const body = tasks.length
+    ? `${header}\n\nTap a task to open it.`
+    : `${header}\n\nNothing here yet.`;
 
-  await ctx.reply(`📋 You have ${tasks.length} task(s):`);
-  for (const t of tasks) {
-    await ctx.reply(
-      `${TYPE_LABELS[t.type]} — ${t.targetChatTitle || t.targetChatId}\n` +
-        `Price: ${t.pricePerAction} coins | Progress: ${t.completedCount}/${t.goalCount}\n` +
-        `Status: ${t.status}`,
-      taskManageMenu(t._id.toString(), t.status)
-    );
-  }
+  await sendOrReplace(ctx, body, myTasksMenu(tasks, filter));
 }
 
 bot.hears("📋 My Tasks", async (ctx) => {
@@ -1028,49 +1199,308 @@ bot.action("cabinet_tasks", async (ctx) => {
   await showMyTasks(ctx, user);
 });
 
-bot.action(/task_pause_(.+)/, async (ctx) => {
+bot.action(/tasklist_(active|completed|paused)/, async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  await showMyTasks(ctx, user, ctx.match[1]);
+});
+
+// Loads a task and refuses it unless the caller owns it — every task_*
+// callback carries a task id that a user could otherwise guess at.
+async function loadOwnedTask(ctx, taskId) {
   await dbConnect();
-  await Task.updateOne({ _id: ctx.match[1] }, { status: "paused" });
-  await ctx.answerCbQuery("Task paused");
-  await ctx.editMessageText("⏸ Task paused.");
+  const user = await getOrCreateUser(ctx);
+  const task = await Task.findById(taskId).catch(() => null);
+  if (!task || task.status === "deleted" || task.ownerTelegramId !== user.telegramId) {
+    await ctx.answerCbQuery("Task not found.", { show_alert: true });
+    return {};
+  }
+  return { user, task };
+}
+
+const UNIT_LABEL = {
+  channel: "subscriptions",
+  group: "subscriptions",
+  views: "views",
+  bot: "bot starts",
+  boost: "boosts",
+  reactions: "reactions",
+};
+
+function taskDetailText(task) {
+  const statusText =
+    task.status === "active" ? "In Progress" : task.status === "paused" ? "Paused" : "Finished";
+  const remaining = Math.max(task.goalCount - task.completedCount, 0);
+  const langs = task.languages?.length
+    ? task.languages.map((c) => LANGUAGES.find((l) => l.code === c)?.label || c).join(", ")
+    : "All users";
+
+  return (
+    `📋 Task #${(task.taskNumber || 0).toLocaleString()}\n` +
+    `Status: ${TASK_STATUS_ICON[task.status] || "▶️"} ${statusText}\n` +
+    `🔍 Task Details:\n` +
+    `• ${task.goalCount} ${UNIT_LABEL[task.type] || "actions"}\n` +
+    `• Reward: ${task.pricePerAction.toLocaleString()} GRAM/unit\n` +
+    `• Completed: ${task.completedCount}/${task.goalCount}\n` +
+    `• Remaining: ${remaining}\n` +
+    `• Refunded for unsubscribes: ${task.refundedCount || 0}\n` +
+    `🔗 ${TYPE_LABELS[task.type]}: ${task.targetChatTitle || task.targetChatId}\n\n` +
+    `Access filters:\n` +
+    `• Account type: ${task.audienceMode === "premium_only" ? "Telegram Premium only" : "All users"}\n` +
+    `• Audience: ${langs}`
+  );
+}
+
+async function showTaskDetail(ctx, task) {
+  // Tasks created before the numbering existed get their number on first
+  // open, so the header is never "Task #0".
+  if (!task.taskNumber) {
+    task.taskNumber = await nextCounterValue("tasks", 1888000);
+    await task.save();
+  }
+  await sendOrReplace(ctx, taskDetailText(task), taskDetailMenu(task));
+}
+
+bot.action(/taskdet_(.+)/, async (ctx) => {
+  const { task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  await ctx.answerCbQuery();
+  await showTaskDetail(ctx, task);
+});
+
+bot.action(/task_pause_(.+)/, async (ctx) => {
+  const { task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  task.status = "paused";
+  await task.save();
+  await ctx.answerCbQuery("⏸ Task paused");
+  await showTaskDetail(ctx, task);
 });
 
 bot.action(/task_resume_(.+)/, async (ctx) => {
-  await dbConnect();
-  await Task.updateOne({ _id: ctx.match[1] }, { status: "active" });
-  await ctx.answerCbQuery("Task resumed");
-  await ctx.editMessageText("▶️ Task resumed.");
+  const { task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  task.status = task.completedCount >= task.goalCount ? "completed" : "active";
+  await task.save();
+  await ctx.answerCbQuery("▶️ Task resumed");
+  await showTaskDetail(ctx, task);
 });
 
+bot.action(/task_notif_(.+)_(on|off)/, async (ctx) => {
+  const { task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  task.notifyOwner = ctx.match[2] === "on";
+  await task.save();
+  await ctx.answerCbQuery(task.notifyOwner ? "🔔 On" : "🔕 Off");
+  await showTaskDetail(ctx, task);
+});
+
+bot.action(/task_acct_(.+)/, async (ctx) => {
+  const { task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  const next = task.audienceMode === "premium_only" ? "all" : "premium_only";
+  const min = computeMinPrice(next, task.languages);
+  // A narrower audience costs more per completion, so the switch is blocked
+  // rather than silently leaving the task priced below its own minimum.
+  if (task.pricePerAction < min) {
+    await ctx.answerCbQuery(
+      `Premium-only needs at least ${min} GRAM/unit. Raise the price first.`,
+      { show_alert: true }
+    );
+    return;
+  }
+  task.audienceMode = next;
+  await task.save();
+  await ctx.answerCbQuery(next === "premium_only" ? "👑 Premium only" : "👥 All users");
+  await showTaskDetail(ctx, task);
+});
+
+bot.action(/task_aud_(.+)/, async (ctx) => {
+  const { task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  await ctx.answerCbQuery();
+  await sendOrReplace(
+    ctx,
+    `🌐 Audience languages\n\nTap to toggle, then Save. No selection = all users.`,
+    languagePickMenu(`taskaud_${task._id}_`, task.languages || [], `taskdet_${task._id}`)
+  );
+});
+
+bot.action(/taskaud_([a-f0-9]{24})_(.+)/, async (ctx) => {
+  const { task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  const code = ctx.match[2];
+  const list = new Set(task.languages || []);
+  list.has(code) ? list.delete(code) : list.add(code);
+  const next = [...list];
+
+  const min = computeMinPrice(task.audienceMode, next);
+  if (task.pricePerAction < min) {
+    await ctx.answerCbQuery(
+      `A language filter needs at least ${min} GRAM/unit. Raise the price first.`,
+      { show_alert: true }
+    );
+    return;
+  }
+  task.languages = next;
+  await task.save();
+  await ctx.answerCbQuery();
+  await sendOrReplace(
+    ctx,
+    `🌐 Audience languages\n\nTap to toggle, then Save. No selection = all users.`,
+    languagePickMenu(`taskaud_${task._id}_`, next, `taskdet_${task._id}`)
+  );
+});
+
+bot.action(/task_link_(.+)/, async (ctx) => {
+  const { task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  await ctx.answerCbQuery("Refreshing…");
+  const link = await resolveInviteLink(task.targetChatId, task.targetChatUsername, task.linkType);
+  if (!link) {
+    await sendOrReplace(
+      ctx,
+      `⚠️ Couldn't create a new invite link. Make sure the bot is still an ` +
+        `admin in "${task.targetChatTitle || task.targetChatId}" with the ` +
+        `"Invite users via link" right.`,
+      backToTaskMenu(task._id.toString())
+    );
+    return;
+  }
+  task.targetInviteLink = link;
+  await task.save();
+  await sendOrReplace(ctx, `🔄 New invite link:\n${link}`, backToTaskMenu(task._id.toString()));
+});
+
+// ---------- change price / add execution ----------
+
+bot.action(/task_price_(.+)/, async (ctx) => {
+  const { user, task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  const min = computeMinPrice(task.audienceMode, task.languages);
+  await setSession(user, "awaiting_task_price", { taskId: task._id.toString() });
+  await ctx.answerCbQuery();
+  await sendOrReplace(
+    ctx,
+    `✏️ Send the new reward per unit for task #${(task.taskNumber || 0).toLocaleString()}.\n\n` +
+      `Current: ${task.pricePerAction.toLocaleString()} GRAM\n` +
+      `Minimum for this audience: ${min.toLocaleString()} GRAM\n\n` +
+      `Note: raising the price does NOT charge you now — the remaining ` +
+      `completions are paid from your balance as they happen.`,
+    backToTaskMenu(task._id.toString())
+  );
+});
+
+bot.action(/task_add_(.+)/, async (ctx) => {
+  const { user, task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  const canAfford = maxAffordable(user, task.pricePerAction);
+  await setSession(user, "awaiting_task_add", { taskId: task._id.toString() });
+  await ctx.answerCbQuery();
+  await sendOrReplace(
+    ctx,
+    `➕ How many extra ${UNIT_LABEL[task.type] || "actions"} do you want to add?\n\n` +
+      `Price: ${task.pricePerAction.toLocaleString()} GRAM each\n` +
+      `💰 Balance: ${(user.donatedBalance + user.earnedBalance).toLocaleString()} GRAM ` +
+      `(up to ${canAfford} more)\n\n` +
+      `Send a number.`,
+    backToTaskMenu(task._id.toString())
+  );
+});
+
+// Called from the text router below once the user replies with a number.
+async function applyTaskPrice(ctx, user, text) {
+  const price = Number(text);
+  const task = await Task.findById(user.sessionData.taskId).catch(() => null);
+  if (!task || task.ownerTelegramId !== user.telegramId) {
+    await clearSession(user);
+    await ctx.reply("Task not found.");
+    return;
+  }
+  const min = computeMinPrice(task.audienceMode, task.languages);
+  if (!Number.isFinite(price) || price < min) {
+    await ctx.reply(`Please send a number of at least ${min.toLocaleString()} GRAM.`);
+    return;
+  }
+  task.pricePerAction = Math.floor(price);
+  await task.save();
+  await clearSession(user);
+  await ctx.reply(taskDetailText(task), taskDetailMenu(task));
+}
+
+async function applyTaskAdd(ctx, user, text) {
+  const count = parseInt(text, 10);
+  const task = await Task.findById(user.sessionData.taskId).catch(() => null);
+  if (!task || task.ownerTelegramId !== user.telegramId) {
+    await clearSession(user);
+    await ctx.reply("Task not found.");
+    return;
+  }
+  if (!Number.isFinite(count) || count <= 0) {
+    await ctx.reply("Please send a valid positive whole number.");
+    return;
+  }
+
+  // Extra executions are paid for up front, the same way the original
+  // goalCount was at publish time (commission included).
+  const spend = await spendForTask(user, count * task.pricePerAction);
+  if (!spend.ok) {
+    await ctx.reply(
+      `❌ Insufficient balance. That would need ${spend.needed.toLocaleString()} GRAM ` +
+        `(commission included).`
+    );
+    return;
+  }
+
+  task.goalCount += count;
+  if (task.status === "completed") task.status = "active";
+  await task.save();
+  await clearSession(user);
+  await ctx.reply(taskDetailText(task), taskDetailMenu(task));
+}
+
+// ---------- delete ----------
+
 bot.action(/task_delete_(.+)/, async (ctx) => {
-  await dbConnect();
-  const task = await Task.findById(ctx.match[1]);
-  if (task) {
-    task.status = "deleted";
-    await task.save();
-    // Refund remaining (undone) portion to the owner's donated balance.
-    const remaining = Math.max(task.goalCount - task.completedCount, 0);
-    const refund = remaining * task.pricePerAction;
-    if (refund > 0) {
-      const owner = await User.findOne({ telegramId: task.ownerTelegramId });
-      if (owner) {
-        owner.donatedBalance += refund;
-        await owner.save();
-        await Transaction.create({
-          telegramId: owner.telegramId,
-          type: "refund",
-          amount: refund,
-          relatedTaskId: task._id,
-          note: "Task deleted — unused balance refunded",
-        });
-      }
+  const { task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  const remaining = Math.max(task.goalCount - task.completedCount, 0);
+  await ctx.answerCbQuery();
+  await sendOrReplace(
+    ctx,
+    `🗑 Delete task #${(task.taskNumber || 0).toLocaleString()}?\n\n` +
+      `${(remaining * task.pricePerAction).toLocaleString()} GRAM for the ` +
+      `${remaining} unfinished unit(s) will be refunded to your balance.\n` +
+      `Workers who already completed it keep their reward.`,
+    taskDeleteConfirmMenu(task._id.toString())
+  );
+});
+
+bot.action(/task_delconf_(.+)/, async (ctx) => {
+  const { user, task } = await loadOwnedTask(ctx, ctx.match[1]);
+  if (!task) return;
+  task.status = "deleted";
+  await task.save();
+
+  // Refund remaining (undone) portion to the owner's donated balance.
+  const remaining = Math.max(task.goalCount - task.completedCount, 0);
+  const refund = remaining * task.pricePerAction;
+  if (refund > 0) {
+    const owner = await User.findOne({ telegramId: task.ownerTelegramId });
+    if (owner) {
+      owner.donatedBalance += refund;
+      await owner.save();
+      await Transaction.create({
+        telegramId: owner.telegramId,
+        type: "refund",
+        amount: refund,
+        relatedTaskId: task._id,
+        note: "Task deleted — unused balance refunded",
+      });
     }
   }
   await ctx.answerCbQuery("Task deleted");
-  await ctx.editMessageText(
-    "🗑 Task deleted. Note: users who already completed it keep their reward, " +
-      "and it will NOT be re-awarded if you recreate the task with the same users."
-  );
+  await showMyTasks(ctx, user);
 });
 
 // ---------- earn flow ----------
@@ -1255,16 +1685,14 @@ bot.action(/viewpost_(.+)/, async (ctx) => {
     if (task.status === "active") {
       task.status = "paused";
       await task.save();
-      await bot.telegram
-        .sendMessage(
-          task.ownerTelegramId,
-          `⏸ Your post task "${task.targetChatTitle || task.targetChatId}" was paused — ` +
-            `I can no longer forward that post.\n\n` +
-            `Either the post was deleted, or I'm not an admin in the channel anymore. ` +
-            `Fix it and resume from 👤 My Cabinet → 📋 My Tasks, or delete the task to ` +
-            `get the unused GRAM refunded.`
-        )
-        .catch(() => {});
+      await notifyTaskOwner(
+        task,
+        `⏸ Your post task "${task.targetChatTitle || task.targetChatId}" was paused — ` +
+          `I can no longer forward that post.\n\n` +
+          `Either the post was deleted, or I'm not an admin in the channel anymore. ` +
+          `Fix it and resume from 👤 My Cabinet → 📋 My Tasks, or delete the task to ` +
+          `get the unused GRAM refunded.`
+      );
     }
     await ctx.answerCbQuery("That post isn't available anymore — try another one.", {
       show_alert: true,
@@ -1375,13 +1803,11 @@ async function recordReport(taskId, user, reason) {
 
   if (task.reportCount >= REPORT_AUTO_PAUSE && task.status === "active") {
     task.status = "paused";
-    await bot.telegram
-      .sendMessage(
-        task.ownerTelegramId,
-        `⚠️ Your post task "${task.targetChatTitle || task.targetChatId}" was paused after ` +
-          `${task.reportCount} reports from workers. An admin will review it.`
-      )
-      .catch(() => {});
+    await notifyTaskOwner(
+      task,
+      `⚠️ Your post task "${task.targetChatTitle || task.targetChatId}" was paused after ` +
+        `${task.reportCount} reports from workers. An admin will review it.`
+    );
   }
 
   await task.save();
@@ -1633,6 +2059,7 @@ bot.on("chat_member", async (ctx) => {
               task._id
             );
             if (deducted > 0) {
+              task.refundedCount = (task.refundedCount || 0) + 1;
               await creditOwnerReclaimed(task.ownerTelegramId, deducted, task._id);
               await bot.telegram
                 .sendMessage(
@@ -1673,7 +2100,7 @@ bot.hears("💰 Earnings", async (ctx) => {
 bot.hears("👤 My Cabinet", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await tryDeleteUserMessage(ctx);
-  await sendClean(ctx, user, "🗂 My Cabinet", cabinetMenu());
+  await showCabinet(ctx, user);
 });
 
 bot.hears("✅ Subscription Check", async (ctx) => {
@@ -1769,6 +2196,16 @@ bot.on("text", async (ctx) => {
         [Markup.button.callback("⬅️ Back", "menu_earn")],
       ])
     );
+    return;
+  }
+
+  if (state === "awaiting_task_price") {
+    await applyTaskPrice(ctx, user, text);
+    return;
+  }
+
+  if (state === "awaiting_task_add") {
+    await applyTaskAdd(ctx, user, text);
     return;
   }
 
@@ -1979,6 +2416,7 @@ async function handleChatInput(ctx, user, message) {
 
   const task = await Task.create({
     ownerTelegramId: user.telegramId,
+    taskNumber: await nextCounterValue("tasks", 1888000),
     type,
     targetChatId: String(chatId),
     targetChatTitle: chatInfo.title,

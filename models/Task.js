@@ -4,6 +4,18 @@ const TaskSchema = new mongoose.Schema(
   {
     ownerTelegramId: { type: Number, required: true, index: true },
 
+    // Human-friendly sequential id shown as "📋 Task #1,888,085". Assigned
+    // from the shared Counter at publish time (older tasks get one lazily
+    // the first time their owner opens them), purely cosmetic.
+    taskNumber: { type: Number, index: true },
+
+    // How many completions were reversed because the worker unsubscribed
+    // inside the minimum-stay window — shown as "Refunded for unsubscribes".
+    refundedCount: { type: Number, default: 0 },
+
+    // Per-task notification switch (👤 owner gets progress/report alerts).
+    notifyOwner: { type: Boolean, default: true },
+
     type: {
       type: String,
       enum: ["channel", "group", "views", "bot", "boost", "reactions"],
