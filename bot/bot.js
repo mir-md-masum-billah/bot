@@ -8,8 +8,6 @@ import {
   mainMenu,
   replyMainMenu,
   earnTypeMenu,
-  reactionCategoryMenu,
-  earnRulesMenu,
   subscriberCountMenu,
   cabinetMenu,
   myTasksMenu,
@@ -515,34 +513,7 @@ bot.action("menu_promote", async (ctx) => {
 });
 
 bot.action("menu_earn", async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  const counts = await getEarnCounts(user.telegramId);
-  await ctx.editMessageText("💰 Choose a category to earn coins:", earnTypeMenu(counts));
-});
-
-bot.action("earn_rules", async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.editMessageText(EARN_RULES_TEXT, earnRulesMenu());
-});
-
-bot.action("earn_reactions", async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  await ctx.answerCbQuery();
-  const { any, fixed } = await getReactionSubCounts(user.telegramId);
-  await ctx.editMessageText(
-    "Select a reaction category.\n" +
-      `Any: ${any}\n` +
-      `Selected: ${fixed}\n\n` +
-      "Any reactions - you can choose for payment.\n\n" +
-      "Selected reactions - the specified reaction must be used for payment.",
-    reactionCategoryMenu()
-  );
-});
-
-bot.action(/reactions_(any|fixed)/, async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  await ctx.answerCbQuery();
-  await showEarnList(ctx, user, `reactions${ctx.match[1]}`, 1);
+  await ctx.editMessageText("💰 Choose a category to earn coins:", earnTypeMenu());
 });
 
 bot.action("menu_cabinet", async (ctx) => {
@@ -999,6 +970,37 @@ async function createWizardTask(ctx, user, paymentMethod) {
     commission = spend.commission;
   }
 
+  // If this owner already has an active/completed task for the exact same
+  // target (same channel/group, and for "views" the same post) with the
+  // same price and audience settings, fold the new count into it instead
+  // of publishing a duplicate. Since it's the same Task document, its
+  // completedBy list is untouched — so anyone who already subscribed/
+  // joined/viewed it under the old request is never shown it again, and
+  // the new units simply extend the same goal. Paused tasks are left
+  // alone (something needs fixing there first), so a fresh task is
+  // published instead.
+  const mergeTarget = await findMergeableTask(user.telegramId, d);
+
+  if (mergeTarget) {
+    mergeTarget.goalCount += d.count;
+    if (mergeTarget.status === "completed") mergeTarget.status = "active";
+    await mergeTarget.save();
+
+    await clearSession(user);
+    await ctx.reply(
+      `✅ Added to your existing task instead of creating a duplicate!\n\n` +
+        `${TYPE_LABELS[d.type]} — ${mergeTarget.targetChatTitle || d.targetChatTitle}\n` +
+        `+${d.count} more requested (goal now ${mergeTarget.goalCount.toLocaleString()}, ` +
+        `${mergeTarget.completedCount.toLocaleString()} already completed)\n` +
+        `Price: ${d.price} GRAM × ${d.count} = ${totalGram} GRAM` +
+        (commission ? ` (+${commission} commission)` : "") +
+        `\n\nAnyone who already did this for you won't be shown it again.` +
+        `\n\nTrack it under 👤 My Cabinet → My Tasks.`,
+      replyMainMenu()
+    );
+    return;
+  }
+
   await Task.create({
     ownerTelegramId: user.telegramId,
     taskNumber: await nextCounterValue("tasks", 1888000),
@@ -1025,6 +1027,39 @@ async function createWizardTask(ctx, user, paymentMethod) {
       (inviteLink ? `\n🔗 Link: ${inviteLink}` : "") +
       `\n\nTrack it under 👤 My Cabinet → My Tasks.`,
     replyMainMenu()
+  );
+}
+
+// Looks up an existing active/completed task from the same owner that is,
+// for the worker's purposes, "the same task": same type + same target
+// (same channel/group, or for "views" the same post) + same price and
+// audience so merging doesn't silently change what was previously offered.
+// Returns null if nothing matches, so the caller falls back to creating a
+// normal new task.
+async function findMergeableTask(ownerTelegramId, d) {
+  const query = {
+    ownerTelegramId,
+    type: d.type,
+    targetChatId: d.targetChatId,
+    linkType: d.linkType,
+    audienceMode: d.audienceMode,
+    pricePerAction: d.price,
+    status: { $in: ["active", "completed"] },
+  };
+  if (d.type === "views") {
+    query.targetMessageId = d.targetMessageId;
+  }
+
+  const wantedLanguages = [...(d.languages || [])].sort();
+  const candidates = await Task.find(query);
+  return (
+    candidates.find((t) => {
+      const taskLanguages = [...(t.languages || [])].sort();
+      return (
+        taskLanguages.length === wantedLanguages.length &&
+        taskLanguages.every((lang, i) => lang === wantedLanguages[i])
+      );
+    }) || null
   );
 }
 
@@ -1561,73 +1596,7 @@ const ANTI_BOT_CHECK_INTERVAL = 10;
 const MIN_STAY_DAYS = 7;
 const MIN_STAY_MS = MIN_STAY_DAYS * 24 * 60 * 60 * 1000;
 
-const EARN_TYPE_MAP = {
-  sub: ["channel", "group"],
-  channel: ["channel"],
-  group: ["group"],
-  views: ["views"],
-  bot: ["bot"],
-  boost: ["boost"],
-  reactionsany: ["reactions"],
-  reactionsfixed: ["reactions"],
-};
-
-// Which reactionType a reactions sub-category filters to — see
-// buildEarnFilter, which adds this on top of the normal type filter.
-const REACTION_SUBTYPE = { reactionsany: "any", reactionsfixed: "fixed" };
-
-// The verb shown on each earn-list action button, per category — matches
-// what a worker actually has to do for that task type.
-const EARN_ACTION_LABEL = {
-  sub: "Subscribe",
-  channel: "Subscribe",
-  group: "Subscribe",
-  boost: "Boost",
-  reactionsany: "React",
-  reactionsfixed: "React",
-};
-
-// Live counts for the 💰 Earnings menu — one number per category, using
-// the exact same eligibility rules as the lists themselves (active,
-// not the viewer's own task, not already completed by them).
-async function getEarnCounts(telegramId) {
-  await dbConnect();
-  const categories = ["channel", "group", "views", "bot", "boost"];
-  const [counts, reactions] = await Promise.all([
-    Promise.all(
-      categories.map((cat) =>
-        Task.countDocuments(buildEarnFilter(EARN_TYPE_MAP[cat], cat, telegramId))
-      )
-    ),
-    Task.countDocuments(buildEarnFilter(["reactions"], "reactionsany", telegramId)),
-  ]);
-  const result = { reactions };
-  categories.forEach((cat, i) => (result[cat] = counts[i]));
-  return result;
-}
-
-// Counts for the "Any reactions / Fixed reactions" sub-screen.
-async function getReactionSubCounts(telegramId) {
-  await dbConnect();
-  const [any, fixed] = await Promise.all([
-    Task.countDocuments(buildEarnFilter(["reactions"], "reactionsany", telegramId)),
-    Task.countDocuments(buildEarnFilter(["reactions"], "reactionsfixed", telegramId)),
-  ]);
-  return { any, fixed };
-}
-
-const EARN_RULES_TEXT =
-  "📋 Earning rules\n\n" +
-  "🚫 Forbidden\n" +
-  "• Unsubscribing from channels and chats earlier than 7 days.\n" +
-  "• Removing a placed reaction.\n" +
-  "• Using more than 3 accounts to earn.\n" +
-  "• Cheating on tasks — fake screenshots.\n" +
-  "• Automating tasks with software or other tools.\n\n" +
-  "❓ Penalties for violations\n" +
-  "• Task ban — 7 days.\n" +
-  "• Repeat violation — another 7 days.\n" +
-  "• Unsubscribing forfeits the full amount earned for that task.";
+const EARN_TYPE_MAP = { sub: ["channel", "group"], views: ["views"], bot: ["bot"] };
 
 // Resolves the public base URL used to build the WebApp verify link.
 // Priority: explicit PUBLIC_URL env var -> Vercel's stable production
@@ -1684,7 +1653,6 @@ function buildEarnFilter(types, category, telegramId) {
     $expr: { $lt: ["$completedCount", "$goalCount"] },
   };
   if (category === "views") filter.targetMessageId = { $exists: true, $ne: null };
-  if (REACTION_SUBTYPE[category]) filter.reactionType = REACTION_SUBTYPE[category];
   return filter;
 }
 
@@ -1697,8 +1665,7 @@ async function showEarnList(ctx, user, category, page = 1) {
 
   const totalCount = await Task.countDocuments(filter);
   if (!totalCount) {
-    const counts = await getEarnCounts(user.telegramId);
-    await sendOrReplace(ctx, "No available tasks right now. Check back later!", earnTypeMenu(counts));
+    await sendOrReplace(ctx, "No available tasks right now. Check back later!", earnTypeMenu());
     return;
   }
 
@@ -1710,24 +1677,23 @@ async function showEarnList(ctx, user, category, page = 1) {
     .skip((safePage - 1) * EARN_PAGE_SIZE)
     .limit(EARN_PAGE_SIZE);
 
-  const actionLabel = EARN_ACTION_LABEL[category] || "Subscribe";
   await sendOrReplace(
     ctx,
     category === "views"
       ? `👁 Post tasks — tap a post to view it and get paid instantly.\n\n` +
           `⚠️ Attention! Some posts are long — scroll them up and down.`
-      : `${TYPE_LABELS[types[0]]} tasks — tap ${actionLabel} to open it, then Check to get paid.`,
+      : `${TYPE_LABELS[types[0]]} tasks — tap Subscribe to open it, then Check to get paid.`,
     earnTaskListMenu(tasks, category, safePage, totalPages)
   );
 }
 
-bot.action(/earn_(sub|channel|group|views|bot|boost)/, async (ctx) => {
+bot.action(/earn_(sub|views|bot)/, async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await ctx.answerCbQuery();
   await showEarnList(ctx, user, ctx.match[1], 1);
 });
 
-bot.action(/earnpage_(sub|channel|group|views|bot|boost|reactionsany|reactionsfixed)_(\d+)/, async (ctx) => {
+bot.action(/earnpage_(sub|views|bot)_(\d+)/, async (ctx) => {
   const user = await getOrCreateUser(ctx);
   const [, category, pageStr] = ctx.match;
   await ctx.answerCbQuery();
@@ -1750,7 +1716,7 @@ bot.action(/earnpage_(sub|channel|group|views|bot|boost|reactionsany|reactionsfi
   }
 });
 
-bot.action(/earnreport_(sub|channel|group|views|bot|boost|reactionsany|reactionsfixed)_(\d+)/, async (ctx) => {
+bot.action(/earnreport_(sub|views|bot)_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery(
     "To report a task, contact support with its link — thanks for flagging it!",
     { show_alert: true }
@@ -2032,19 +1998,14 @@ bot.action(/verify_(.+)/, async (ctx) => {
 async function refreshEarnListInPlace(ctx, task, completingTelegramId) {
   try {
     await dbConnect();
-    const category =
-      task.type === "reactions"
-        ? task.reactionType === "fixed"
-          ? "reactionsfixed"
-          : "reactionsany"
-        : task.type;
+    const category = task.type === "views" ? "views" : task.type === "bot" ? "bot" : "sub";
 
     // The current page is always the 3rd button of the pagination row
     // (["1", "<", `${page}`, ">", `${totalPages}`]) — see earnTaskListMenu.
     let page = 1;
     const rows = ctx.callbackQuery?.message?.reply_markup?.inline_keyboard || [];
     for (const row of rows) {
-      const match = row[2]?.callback_data?.match(/^earnpage_[a-z]+_(\d+)$/);
+      const match = row[2]?.callback_data?.match(/^earnpage_(?:sub|views|bot)_(\d+)$/);
       if (match) {
         page = Number(match[1]);
         break;
@@ -2056,8 +2017,7 @@ async function refreshEarnListInPlace(ctx, task, completingTelegramId) {
 
     const totalCount = await Task.countDocuments(filter);
     if (!totalCount) {
-      const counts = await getEarnCounts(completingTelegramId);
-      await ctx.editMessageText("No available tasks right now. Check back later!", earnTypeMenu(counts));
+      await ctx.editMessageText("No available tasks right now. Check back later!", earnTypeMenu());
       return;
     }
 
@@ -2213,8 +2173,7 @@ bot.hears("📢 Promote", async (ctx) => {
 bot.hears("💰 Earnings", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await tryDeleteUserMessage(ctx);
-  const counts = await getEarnCounts(user.telegramId);
-  await sendClean(ctx, user, "💰 Choose a category to earn coins:", earnTypeMenu(counts));
+  await sendClean(ctx, user, "💰 Choose a category to earn coins:", earnTypeMenu());
 });
 
 bot.hears("👤 My Cabinet", async (ctx) => {
@@ -2531,6 +2490,36 @@ async function handleChatInput(ctx, user, message) {
     } else {
       await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} coins.`);
     }
+    return;
+  }
+
+  // Same "don't publish a duplicate" rule as the main wizard: fold into an
+  // existing active/completed task for this exact chat + price if the
+  // owner already has one, instead of creating a second one.
+  const existing = await Task.findOne({
+    ownerTelegramId: user.telegramId,
+    type,
+    targetChatId: String(chatId),
+    pricePerAction: price,
+    status: { $in: ["active", "completed"] },
+  });
+
+  if (existing) {
+    existing.goalCount += count;
+    if (existing.status === "completed") existing.status = "active";
+    await existing.save();
+
+    await clearSession(user);
+    await ctx.reply(
+      `✅ Added to your existing task instead of creating a duplicate!\n\n` +
+        `${TYPE_LABELS[type]} — ${existing.targetChatTitle || chatInfo.title || chatUsername}\n` +
+        `+${count} more requested (goal now ${existing.goalCount.toLocaleString()}, ` +
+        `${existing.completedCount.toLocaleString()} already completed)\n` +
+        `Price: ${price} coins × ${count} = ${price * count} coins` +
+        (spend.commission ? ` (+${spend.commission} commission)` : "") +
+        `\n\nTrack it under 🗂 My Cabinet → My Tasks.`,
+      mainMenu()
+    );
     return;
   }
 
