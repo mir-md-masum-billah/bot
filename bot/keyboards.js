@@ -61,10 +61,36 @@ export const taskManageMenu = (taskId, status) =>
     [Markup.button.callback("⬅️ Back to list", "cabinet_tasks")],
   ]);
 
-export const earnActionMenu = (taskId) =>
+// (earnActionMenu removed — replaced by the paginated earnTaskListMenu below)
+// ---------- earn task list (channels/groups/etc, paginated) ----------
+
+// One row per task: a URL button to actually open/join the chat, paired
+// with a "Check" button the bot uses to verify membership and pay out.
+export const earnTaskListMenu = (tasks, category, page, totalPages) => {
+  const rows = tasks.map((t) => [
+    Markup.button.url(`💲 +${t.pricePerAction} | Subscribe`, t.targetInviteLink || "https://t.me"),
+    Markup.button.callback("🔄 Check", `verify_${t._id}`),
+  ]);
+
+  rows.push([
+    Markup.button.callback("1", `earnpage_${category}_1`),
+    Markup.button.callback("<", `earnpage_${category}_${Math.max(1, page - 1)}`),
+    Markup.button.callback(`${page}`, `earnpage_${category}_${page}`),
+    Markup.button.callback(">", `earnpage_${category}_${Math.min(totalPages, page + 1)}`),
+    Markup.button.callback(`${totalPages}`, `earnpage_${category}_${totalPages}`),
+  ]);
+  rows.push([Markup.button.callback("❌ Report", `earnreport_${category}_${page}`)]);
+  rows.push([Markup.button.callback("⬅️ Back", "menu_earn")]);
+
+  return Markup.inlineKeyboard(rows);
+};
+
+// Shown when a user's periodic human-verification is due (see
+// ANTI_BOT_CHECK_INTERVAL in bot.js) before any further Check taps count.
+export const humanVerifyMenu = (verifyUrl) =>
   Markup.inlineKeyboard([
-    [Markup.button.callback("✅ I've done it — Check", `verify_${taskId}`)],
-    [Markup.button.callback("⏭ Skip", "earn_sub")],
+    [Markup.button.webApp("🧩 Verify", verifyUrl)],
+    [Markup.button.callback("✅ Continue", "hv_continue")],
   ]);
 
 // ---------- promote wizard (channel/group/post/boost/reactions) ----------

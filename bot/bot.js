@@ -11,7 +11,6 @@ import {
   subscriberCountMenu,
   cabinetMenu,
   taskManageMenu,
-  earnActionMenu,
   promoteTypeReplyMenu,
   adminStatusReplyMenu,
   linkTypeMenu,
@@ -23,7 +22,10 @@ import {
   paymentMethodMenu,
   joinRequestConfirmMenu,
   publishConfirmMenu,
+  earnTaskListMenu,
+  humanVerifyMenu,
 } from "./keyboards.js";
+import { nextCounterValue } from "../models/Counter.js";
 
 const COMMISSION_PERCENT = Number(process.env.EARNED_COMMISSION_PERCENT || 10);
 // No official published GRAM<->Stars rate exists for this kind of bot —
@@ -161,6 +163,31 @@ async function isUserMemberOf(chatId, userId) {
     return ["member", "administrator", "creator"].includes(member.status);
   } catch (e) {
     return false;
+  }
+}
+
+// Always produces a working invite link for the earn-list "Subscribe"
+// button, even for private chats with no @username. For join-request tasks
+// this is the join-request link created at publish time (matches the
+// "creates_join_request" flow); for everything else it's the chat's
+// @username if public, or a fresh regular invite link if private.
+async function resolveInviteLink(chatId, username, linkType) {
+  if (linkType === "join_request") {
+    try {
+      const link = await bot.telegram.createChatInviteLink(chatId, {
+        creates_join_request: true,
+      });
+      return link.invite_link;
+    } catch (e) {
+      return username ? `https://t.me/${username}` : null;
+    }
+  }
+  if (username) return `https://t.me/${username}`;
+  try {
+    const link = await bot.telegram.createChatInviteLink(chatId);
+    return link.invite_link;
+  } catch (e) {
+    return null;
   }
 }
 
@@ -555,16 +582,7 @@ async function createWizardTask(ctx, user, paymentMethod) {
   const d = user.sessionData;
   const totalGram = d.price * d.count;
 
-  let inviteLink;
-  if (d.linkType === "join_request") {
-    try {
-      inviteLink = await bot.telegram.createChatInviteLink(d.targetChatId, {
-        creates_join_request: true,
-      });
-    } catch (e) {
-      // Non-fatal — the task can still exist without a dedicated link.
-    }
-  }
+  const inviteLink = await resolveInviteLink(d.targetChatId, d.targetChatUsername, d.linkType);
 
   let commission = 0;
   if (paymentMethod === "gram") {
@@ -582,6 +600,7 @@ async function createWizardTask(ctx, user, paymentMethod) {
     targetChatId: d.targetChatId,
     targetChatTitle: d.targetChatTitle,
     targetChatUsername: d.targetChatUsername,
+    targetInviteLink: inviteLink,
     linkType: d.linkType,
     audienceMode: d.audienceMode,
     languages: d.languages || [],
@@ -596,7 +615,7 @@ async function createWizardTask(ctx, user, paymentMethod) {
       `${TYPE_LABELS[d.type]} — ${d.targetChatTitle}\n` +
       `Price: ${d.price} GRAM × ${d.count} = ${totalGram} GRAM` +
       (commission ? ` (+${commission} commission)` : "") +
-      (inviteLink ? `\n🔗 Join-request link: ${inviteLink.invite_link}` : "") +
+      (inviteLink ? `\n🔗 Link: ${inviteLink}` : "") +
       `\n\nTrack it under 👤 My Cabinet → My Tasks.`,
     replyMainMenu()
   );
@@ -763,33 +782,97 @@ bot.action(/task_delete_(.+)/, async (ctx) => {
 
 // ---------- earn flow ----------
 
-bot.action(/earn_(sub|views|bot)/, async (ctx) => {
-  await dbConnect();
-  const user = await getOrCreateUser(ctx);
-  const typeMap = { sub: ["channel", "group"], views: ["views"], bot: ["bot"] };
-  const types = typeMap[ctx.match[1]];
+const EARN_PAGE_SIZE = 10;
+// After this many successful Checks since the last verification, the user
+// must pass the human-verification puzzle again before another Check counts.
+const ANTI_BOT_CHECK_INTERVAL = 15;
 
-  const task = await Task.findOne({
+const EARN_TYPE_MAP = { sub: ["channel", "group"], views: ["views"], bot: ["bot"] };
+
+function verifyUrlFor(user) {
+  const base = process.env.PUBLIC_URL || "";
+  return `${base}/verify?tid=${user.telegramId}`;
+}
+
+async function promptHumanVerification(ctx, user) {
+  await ctx.reply(
+    "🔒 Please verify that you are human to keep earning.",
+    humanVerifyMenu(verifyUrlFor(user))
+  );
+}
+
+async function showEarnList(ctx, user, category, page = 1) {
+  await dbConnect();
+  const types = EARN_TYPE_MAP[category];
+  if (!types) return;
+
+  const filter = {
     type: { $in: types },
     status: "active",
     ownerTelegramId: { $ne: user.telegramId },
     completedBy: { $ne: user.telegramId },
     $expr: { $lt: ["$completedCount", "$goalCount"] },
-  }).sort({ pricePerAction: -1 });
+  };
 
-  if (!task) {
-    await ctx.answerCbQuery();
-    await ctx.editMessageText("No available tasks right now. Check back later!", earnTypeMenu());
+  const totalCount = await Task.countDocuments(filter);
+  if (!totalCount) {
+    await ctx.reply("No available tasks right now. Check back later!", earnTypeMenu());
     return;
   }
 
+  const totalPages = Math.max(1, Math.ceil(totalCount / EARN_PAGE_SIZE));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+
+  const tasks = await Task.find(filter)
+    .sort({ pricePerAction: -1, _id: 1 })
+    .skip((safePage - 1) * EARN_PAGE_SIZE)
+    .limit(EARN_PAGE_SIZE);
+
+  await ctx.reply(
+    `${TYPE_LABELS[types[0]]} tasks — tap Subscribe to open it, then Check to get paid.`,
+    earnTaskListMenu(tasks, category, safePage, totalPages)
+  );
+}
+
+bot.action(/earn_(sub|views|bot)/, async (ctx) => {
+  const user = await getOrCreateUser(ctx);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(
-    `${TYPE_LABELS[task.type]}\n` +
-      `${task.targetChatTitle || task.targetChatUsername || task.targetChatId}\n\n` +
-      `💰 Reward: ${task.pricePerAction} coins\n\n` +
-      `1. Open and join/subscribe.\n2. Come back and tap Check.`,
-    earnActionMenu(task._id.toString())
+  await showEarnList(ctx, user, ctx.match[1], 1);
+});
+
+bot.action(/earnpage_(sub|views|bot)_(\d+)/, async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  const [, category, pageStr] = ctx.match;
+  await ctx.answerCbQuery();
+  await dbConnect();
+  const types = EARN_TYPE_MAP[category];
+  const filter = {
+    type: { $in: types },
+    status: "active",
+    ownerTelegramId: { $ne: user.telegramId },
+    completedBy: { $ne: user.telegramId },
+    $expr: { $lt: ["$completedCount", "$goalCount"] },
+  };
+  const totalCount = await Task.countDocuments(filter);
+  const totalPages = Math.max(1, Math.ceil(totalCount / EARN_PAGE_SIZE));
+  const page = Math.min(Math.max(1, Number(pageStr)), totalPages);
+  const tasks = await Task.find(filter)
+    .sort({ pricePerAction: -1, _id: 1 })
+    .skip((page - 1) * EARN_PAGE_SIZE)
+    .limit(EARN_PAGE_SIZE);
+  try {
+    await ctx.editMessageReplyMarkup(
+      earnTaskListMenu(tasks, category, page, totalPages).reply_markup
+    );
+  } catch (e) {
+    // "message not modified" when already on that page — harmless.
+  }
+});
+
+bot.action(/earnreport_(sub|views|bot)_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery(
+    "To report a task, contact support with its link — thanks for flagging it!",
+    { show_alert: true }
   );
 });
 
@@ -807,15 +890,20 @@ bot.action(/verify_(.+)/, async (ctx) => {
     return;
   }
 
+  if (!user.isVerified) {
+    await ctx.answerCbQuery();
+    await promptHumanVerification(ctx, user);
+    return;
+  }
+
   const isMember =
     task.type === "views" || task.type === "bot"
       ? true // views/bot completion can't be verified via getChatMember; trust + admin review
       : await isUserMemberOf(task.targetChatId, user.telegramId);
 
   if (!isMember) {
-    await ctx.answerCbQuery("❌ Not detected yet. Make sure you joined, then try again.", {
-      show_alert: true,
-    });
+    await ctx.answerCbQuery();
+    await ctx.reply("ℹ️ You are not subscribed to the channel/chat yet. Subscribe and try again.");
     return;
   }
 
@@ -826,8 +914,56 @@ bot.action(/verify_(.+)/, async (ctx) => {
 
   await creditEarned(user, task.pricePerAction, "Completed promotion task", task._id);
 
-  await ctx.answerCbQuery("✅ Verified! Coins added.", { show_alert: true });
-  await ctx.editMessageText(`✅ Success! +${task.pricePerAction} coins credited.`);
+  const taskNumber = await nextCounterValue("completions", 800000);
+  const balance = user.donatedBalance + user.earnedBalance;
+  await ctx.answerCbQuery("✅ Verified! Coins added.");
+  await ctx.reply(
+    `✅ Task №${taskNumber.toLocaleString()} completed\n\n` +
+      `💵 You received +${task.pricePerAction.toLocaleString()} GRAM\n` +
+      `💰 Balance: ${balance.toLocaleString()} GRAM`
+  );
+
+  user.tasksSinceVerification += 1;
+  if (user.tasksSinceVerification >= ANTI_BOT_CHECK_INTERVAL) {
+    user.tasksSinceVerification = 0;
+    user.isVerified = false;
+    await user.save();
+    await promptHumanVerification(ctx, user);
+  } else {
+    await user.save();
+  }
+});
+
+// "✅ Continue" on the verification prompt, tapped before actually solving
+// the puzzle (the puzzle itself reports success via web_app_data below).
+// Named "hv_continue" (not "verify_continue") so it can never collide with
+// the /verify_(.+)/ task-Check handler above.
+bot.action("hv_continue", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (!user.isVerified) {
+    await ctx.answerCbQuery("Please tap Verify first.", { show_alert: true });
+    return;
+  }
+  await ctx.answerCbQuery("You're verified — carry on!");
+  await ctx.deleteMessage().catch(() => {});
+});
+
+// The verify.js WebApp calls Telegram.WebApp.sendData(...) once the puzzle
+// is solved, which arrives here as a private-chat message.
+bot.on(message("web_app_data"), async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  let payload = {};
+  try {
+    payload = JSON.parse(ctx.message.web_app_data.data);
+  } catch (e) {
+    // ignore malformed payloads
+  }
+  if (payload.verified) {
+    user.isVerified = true;
+    user.tasksSinceVerification = 0;
+    await user.save();
+    await ctx.reply("✅ Verified! You can keep earning — tap Check again on any task.");
+  }
 });
 
 // ---------- persistent reply-keyboard buttons ----------
@@ -851,34 +987,11 @@ bot.hears("👤 My Cabinet", async (ctx) => {
 });
 
 bot.hears("✅ Subscription Check", async (ctx) => {
-  // Shortcut: jump straight into the "subscribe" earn flow so the user can
-  // recheck / grab the next available task without navigating the menu.
-  await dbConnect();
+  // Shortcut: jump straight into the "subscribe" earn list (channels +
+  // groups) so the user can grab any available task without navigating.
   const user = await getOrCreateUser(ctx);
   await tryDeleteUserMessage(ctx);
-
-  const task = await Task.findOne({
-    type: { $in: ["channel", "group"] },
-    status: "active",
-    ownerTelegramId: { $ne: user.telegramId },
-    completedBy: { $ne: user.telegramId },
-    $expr: { $lt: ["$completedCount", "$goalCount"] },
-  }).sort({ pricePerAction: -1 });
-
-  if (!task) {
-    await sendClean(ctx, user, "No available subscription tasks right now. Check back later!");
-    return;
-  }
-
-  await sendClean(
-    ctx,
-    user,
-    `${TYPE_LABELS[task.type]}\n` +
-      `${task.targetChatTitle || task.targetChatUsername || task.targetChatId}\n\n` +
-      `💰 Reward: ${task.pricePerAction} coins\n\n` +
-      `1. Open and join/subscribe.\n2. Come back and tap Check.`,
-    earnActionMenu(task._id.toString())
-  );
+  await showEarnList(ctx, user, "sub", 1);
 });
 
 bot.hears("📤 Checks", async (ctx) => {

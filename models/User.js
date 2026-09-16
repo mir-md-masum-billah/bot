@@ -17,6 +17,13 @@ const UserSchema = new mongoose.Schema(
     referredBy: { type: Number, default: null },
     isBanned: { type: Boolean, default: false },
 
+    // Anti-bot "human verification" (drag-puzzle captcha). Users start
+    // verified; after every ANTI_BOT_CHECK_INTERVAL completed earn-checks
+    // (see bot.js) this flips to false and tasksSinceVerification resets,
+    // forcing a fresh verification before further Check taps are accepted.
+    isVerified: { type: Boolean, default: true },
+    tasksSinceVerification: { type: Number, default: 0 },
+
     // Simple in-memory-style state machine for multi-step bot flows
     // (e.g. "waiting for subscriber count", "waiting for chat forward")
     sessionState: { type: String, default: null },

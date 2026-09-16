@@ -14,6 +14,10 @@ const TaskSchema = new mongoose.Schema(
     targetChatId: { type: String, required: true },
     targetChatTitle: String,
     targetChatUsername: String,
+    // Always resolved at publish time so the "Subscribe" button in the earn
+    // list always has a working link, even for private chats with no
+    // @username (see resolveInviteLink in bot.js).
+    targetInviteLink: String,
 
     // Regular invite link (members join instantly) vs join-request link
     // (owner must approve; worker is paid as soon as they submit the request).
