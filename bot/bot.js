@@ -285,17 +285,31 @@ async function spendForTask(user, totalCost) {
   return { ok: true, commission };
 }
 
-// Every inline-button tap replaces the message it came from instead of
-// stacking a new one underneath: the old menu is deleted, then the new one
-// is sent. That keeps the freshest buttons at the bottom of the chat (right
-// where the user's thumb is) and stops the same list appearing three times.
-// Deleting is used rather than editing because a viewed post is forwarded
-// *between* the two menus — an edited-in-place menu would be left stranded
-// above the post the user just opened.
-async function sendOrReplace(ctx, text, extra) {
-  if (ctx.callbackQuery?.message) {
-    await ctx.deleteMessage().catch(() => {});
+// Every inline-button tap updates the message it came from in place —
+// editMessageText — instead of deleting it and sending a new one. This
+// keeps the same message id/scroll position throughout a whole cabinet/task
+// navigation, so nothing "jumps" or gets deleted-and-recreated on screen.
+//
+// Pass { forceNew: true } for the one flow where an edit would be wrong: a
+// viewed post is forwarded as its own message *between* the old menu and
+// the new one, so editing the old menu in place would leave it stranded
+// above that post instead of under it. That single call site sends a fresh
+// message on purpose; everywhere else always edits.
+async function sendOrReplace(ctx, text, extra, { forceNew = false } = {}) {
+  if (!forceNew && ctx.callbackQuery?.message) {
+    try {
+      await ctx.editMessageText(text, extra);
+      return;
+    } catch (e) {
+      const desc = e?.description || e?.message || "";
+      // Content identical to what's already shown — nothing to do.
+      if (/message is not modified/i.test(desc)) return;
+      // Anything else (message too old, already deleted, wasn't a text
+      // message) — fall through to a fresh send so the user still gets
+      // a working menu instead of silence.
+    }
   }
+  if (ctx.callbackQuery?.message) await ctx.deleteMessage().catch(() => {});
   return ctx.reply(text, extra);
 }
 
@@ -1733,16 +1747,17 @@ bot.action(/viewpost_(.+)/, async (ctx) => {
   const postNumber = await nextCounterValue("completions", 800000);
   const balance = user.donatedBalance + user.earnedBalance;
   await ctx.answerCbQuery("✅ Paid!");
-  // The old task list is deleted here rather than refreshed in place: the
-  // post was just forwarded below it, so the reward + "Next Post" buttons
-  // belong underneath the post, not stranded above it. Tapping Next Post
-  // rebuilds the list from the DB, which no longer contains this task.
+  // forceNew: the post was just forwarded below the old task-list message,
+  // so the reward + "Next Post" buttons belong underneath the post, not
+  // edited into the list above it. Tapping Next Post rebuilds the list
+  // from the DB, which no longer contains this task.
   await sendOrReplace(
     ctx,
     `💲 You earned +${updatedTask.pricePerAction.toLocaleString()} GRAM for viewing post ` +
       `#${postNumber.toLocaleString()}!\n` +
       `💰 Your balance: ${balance.toLocaleString()} GRAM`,
-    afterViewMenu(updatedTask._id.toString())
+    afterViewMenu(updatedTask._id.toString()),
+    { forceNew: true }
   );
 
   user.totalTasksCompleted += 1;
