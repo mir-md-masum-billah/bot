@@ -227,9 +227,11 @@ export const addBotToChannelMenu = (addBotLink) =>
   ]);
 
 // Sent right after a worker is shown a promoted post and paid for it.
+// "Next Post" goes straight to the next unseen post (nextpost_views in
+// bot.js) so viewing runs post → post → post without returning to the list.
 export const afterViewMenu = (taskId) =>
   Markup.inlineKeyboard([
-    [Markup.button.callback("➡️ Next Post", "earn_views")],
+    [Markup.button.callback("➡️ Next Post", "nextpost_views")],
     [Markup.button.callback("❌ Report", `postreport_${taskId}`)],
     [Markup.button.callback("⬅️ Back", "menu_earn")],
   ]);

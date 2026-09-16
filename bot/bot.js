@@ -1729,15 +1729,21 @@ const REPORT_AUTO_PAUSE = 3;
 
 // ---------- post (views) tasks: show the post, pay, allow reporting ----------
 
-bot.action(/viewpost_(.+)/, async (ctx) => {
+// Finds the next post the worker hasn't seen yet, in the same order the
+// earn list uses (highest price first). Used by the "➡️ Next Post" button
+// so viewing continues straight through post → post → post, instead of
+// dropping the worker back on the list (see deliverViewTask below).
+async function findNextViewTask(telegramId) {
   await dbConnect();
-  const user = await getOrCreateUser(ctx);
-  const task = await Task.findById(ctx.match[1]);
+  const filter = buildEarnFilter(EARN_TYPE_MAP.views, "views", telegramId);
+  return Task.findOne(filter).sort({ pricePerAction: -1, _id: 1 });
+}
 
-  if (!task || task.status !== "active" || task.completedCount >= task.goalCount) {
-    await ctx.answerCbQuery("This task is no longer available.");
-    return;
-  }
+// Shared by both entry points — tapping a post in the list (viewpost_) and
+// tapping "➡️ Next Post" after a view (nextpost_views) — so the two can
+// never drift apart. Forwards the post, pays the worker, and shows the
+// reward + Next Post/Report/Back menu underneath it.
+async function deliverViewTask(ctx, user, task) {
   if (task.completedBy.includes(user.telegramId)) {
     await ctx.answerCbQuery("You already viewed this post.");
     return;
@@ -1813,8 +1819,8 @@ bot.action(/viewpost_(.+)/, async (ctx) => {
   await ctx.answerCbQuery("✅ Paid!");
   // forceNew: the post was just forwarded below the old task-list message,
   // so the reward + "Next Post" buttons belong underneath the post, not
-  // edited into the list above it. Tapping Next Post rebuilds the list
-  // from the DB, which no longer contains this task.
+  // edited into the list above it. Tapping Next Post goes straight to the
+  // next unseen post (see nextpost_views below), not back to the list.
   await sendOrReplace(
     ctx,
     `💲 You earned +${updatedTask.pricePerAction.toLocaleString()} GRAM for viewing post ` +
@@ -1835,6 +1841,39 @@ bot.action(/viewpost_(.+)/, async (ctx) => {
   } else {
     await user.save();
   }
+}
+
+bot.action(/viewpost_(.+)/, async (ctx) => {
+  await dbConnect();
+  const user = await getOrCreateUser(ctx);
+  const task = await Task.findById(ctx.match[1]);
+
+  if (!task || task.status !== "active" || task.completedCount >= task.goalCount) {
+    await ctx.answerCbQuery("This task is no longer available.");
+    return;
+  }
+  await deliverViewTask(ctx, user, task);
+});
+
+// "➡️ Next Post" — jumps straight to the next unseen post (the flow shown
+// in the screenshots: post → reward → next post, one after another),
+// instead of dropping the worker back on the 👁 Post list.
+bot.action("nextpost_views", async (ctx) => {
+  await dbConnect();
+  const user = await getOrCreateUser(ctx);
+  const task = await findNextViewTask(user.telegramId);
+
+  if (!task) {
+    await ctx.answerCbQuery();
+    await sendOrReplace(
+      ctx,
+      "😔 No more posts to view right now — check back later!",
+      earnTypeMenu(),
+      { forceNew: true }
+    );
+    return;
+  }
+  await deliverViewTask(ctx, user, task);
 });
 
 bot.action(/postreport_(.+)/, async (ctx) => {
@@ -1863,7 +1902,7 @@ bot.action(/prsn_(.+)_(adult|other)/, async (ctx) => {
     ctx,
     "✅ Thanks — your report has been recorded.",
     Markup.inlineKeyboard([
-      [Markup.button.callback("➡️ Next Post", "earn_views")],
+      [Markup.button.callback("➡️ Next Post", "nextpost_views")],
       [Markup.button.callback("⬅️ Back", "menu_earn")],
     ])
   );
@@ -2271,7 +2310,7 @@ bot.on("text", async (ctx) => {
     await ctx.reply(
       "✅ Thanks — your report has been recorded.",
       Markup.inlineKeyboard([
-        [Markup.button.callback("➡️ Next Post", "earn_views")],
+        [Markup.button.callback("➡️ Next Post", "nextpost_views")],
         [Markup.button.callback("⬅️ Back", "menu_earn")],
       ])
     );
