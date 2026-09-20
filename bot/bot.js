@@ -1077,9 +1077,9 @@ bot.hears("🤖 Bot", async (ctx) => {
   await setSession(user, "choosing_bot_task_type", { type: "bot" });
   await ctx.reply(
     "🤖 Choose the task type:\n\n" +
-      "▶️ Bot start only — the worker opens the bot and presses Start. No other actions, and Check pays out instantly.\n\n" +
-      "📝 With additional conditions — you can request additional actions (e.g. subscribing to sponsors). " +
-      "The worker must send a screenshot, and it's only paid once approved.",
+      "▶️ Bot start only — the worker opens the bot and presses Start, then sends a screenshot proving it. No other actions required.\n\n" +
+      "📝 With additional conditions — you can request additional actions (e.g. subscribing to sponsors) on top of Start. " +
+      "Either way, the worker's screenshot is reviewed (by you, or auto-approved after 24h) before they're paid.",
     botTaskTypeMenu()
   );
 });
@@ -2105,6 +2105,9 @@ async function showEarnList(ctx, user, category, page = 1) {
     category === "views"
       ? `👁 Post tasks — tap a post to view it and get paid instantly.\n\n` +
           `⚠️ Attention! Some posts are long — scroll them up and down.`
+      : category === "bot"
+      ? `🤖 Bot tasks — tap "Go to the Bot", complete it, then send a screenshot to get paid.\n\n` +
+          `⏳ Your screenshot is reviewed by the task owner (or auto-approved after 24h).`
       : `${TYPE_LABELS[types[0]]} tasks — tap Subscribe to open it, then Check to get paid.`,
     earnTaskListMenu(tasks, category, safePage, totalPages)
   );
@@ -2364,6 +2367,53 @@ async function recordReport(taskId, user, reason) {
   await task.save();
 }
 
+// "🤖 Go to the Bot" — the single-button flow that replaced the old
+// URL-button + "🔄 Check" pair for bot-type tasks. Every bot task now goes
+// through screenshot review (owner approves, or it auto-approves after 24h
+// via the cron job) — there is no trust-based instant-pay path left for
+// bots. This mirrors the reference app's list, where tapping the task
+// button both opens the target bot and starts the proof flow.
+bot.action(/^golink_(.+)$/, async (ctx) => {
+  await dbConnect();
+  const user = await getOrCreateUser(ctx);
+  const task = await Task.findById(ctx.match[1]);
+
+  if (!task || task.status !== "active" || task.type !== "bot") {
+    await ctx.answerCbQuery("This task is no longer available.");
+    return;
+  }
+  if (task.completedBy.includes(user.telegramId)) {
+    await ctx.answerCbQuery("You already completed this task.");
+    return;
+  }
+  if (!user.isVerified) {
+    await ctx.answerCbQuery();
+    await promptHumanVerification(ctx, user);
+    return;
+  }
+  const pendingAlready = await Submission.findOne({
+    taskId: task._id,
+    workerTelegramId: user.telegramId,
+    status: "pending",
+  });
+  if (pendingAlready) {
+    await ctx.answerCbQuery("You already sent a screenshot for this task — waiting on review.");
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  await setSession(user, "awaiting_proof_photo", { proofTaskId: String(task._id) });
+  await ctx.reply(
+    `🤖 Open the bot below and press Start.` +
+      (task.conditionText ? `\n\n📋 Also complete: ${task.conditionText}` : "") +
+      `\n\n📸 Then come back and send a screenshot here showing you did it — it's reviewed before you're paid.\n\n` +
+      `⚠️ Fake/cheating screenshots get your submission rejected and the coins clawed back.`,
+    Markup.inlineKeyboard([
+      [Markup.button.url("🔗 Open Bot", task.targetInviteLink || "https://t.me")],
+    ])
+  );
+});
+
 bot.action(/verify_(.+)/, async (ctx) => {
   await dbConnect();
   const user = await getOrCreateUser(ctx);
@@ -2384,10 +2434,11 @@ bot.action(/verify_(.+)/, async (ctx) => {
     return;
   }
 
-  // "🤖 Bot — with additional conditions" tasks aren't paid on trust: the
-  // worker has to submit a screenshot first, and Check here just opens
-  // that flow instead of crediting anything.
-  if (task.requiresProof) {
+  // "🤖 Bot" tasks are never paid on trust anymore (see golink_ above) —
+  // this stays as a defensive fallback for any old "🔄 Check" button still
+  // cached in a chat from before this change, so it can't slip through to
+  // the instant-pay path below.
+  if (task.requiresProof || task.type === "bot") {
     const pendingAlready = await Submission.findOne({
       taskId: task._id,
       workerTelegramId: user.telegramId,

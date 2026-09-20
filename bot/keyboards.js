@@ -227,6 +227,18 @@ export const earnTaskListMenu = (tasks, category, page, totalPages) => {
             `viewpost_${t._id}`
           ),
         ])
+      : category === "bot"
+      ? // Bot tasks: a single button (no separate URL + Check pair). Tapping
+        // it sends the bot link AND starts the screenshot-proof flow — every
+        // bot task now goes through submission review, matching the
+        // reference app's "Go to the bot" list instead of a trust-based
+        // instant-pay Check.
+        tasks.map((t) => [
+          Markup.button.callback(
+            `🤖 +${t.pricePerAction} | Go to the Bot`,
+            `golink_${t._id}`
+          ),
+        ])
       : tasks.map((t) => [
           Markup.button.url(
             `💲 +${t.pricePerAction} | ${verb}`,
