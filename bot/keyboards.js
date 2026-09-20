@@ -228,15 +228,13 @@ export const earnTaskListMenu = (tasks, category, page, totalPages) => {
           ),
         ])
       : category === "bot"
-      ? // Bot tasks: a single button (no separate URL + Check pair). Tapping
-        // it sends the bot link AND starts the screenshot-proof flow — every
-        // bot task now goes through submission review, matching the
-        // reference app's "Go to the bot" list instead of a trust-based
-        // instant-pay Check.
+      ? // Bot tasks never pay out on a trust-based "Check" tap anymore — one
+        // tap opens the task detail (rules + Go to the Bot), which is where
+        // the screenshot-proof flow actually starts. See botdetail_ in bot.js.
         tasks.map((t) => [
           Markup.button.callback(
-            `🤖 +${t.pricePerAction} | Go to the Bot`,
-            `golink_${t._id}`
+            `🤖 Go to the bot | +${t.pricePerAction.toLocaleString()} GRAM`,
+            `botdetail_${t._id}`
           ),
         ])
       : tasks.map((t) => [
@@ -255,8 +253,10 @@ export const earnTaskListMenu = (tasks, category, page, totalPages) => {
     Markup.button.callback(`${totalPages}`, `earnpage_${category}_${totalPages}`),
   ]);
   // Views tasks get their own Report button right under the post the user
-  // just saw (see afterViewMenu), so the generic one is only for the rest.
-  if (category !== "views") {
+  // just saw (see afterViewMenu). Bot tasks get Report on the task detail
+  // screen instead (see botTaskDetailMenu below). Everything else gets the
+  // generic list-level Report.
+  if (category !== "views" && category !== "bot") {
     rows.push([Markup.button.callback("❌ Report", `earnreport_${category}_${page}`)]);
   }
   rows.push([Markup.button.callback("⬅️ Back", "menu_earn")]);
@@ -286,6 +286,28 @@ export const afterViewMenu = (taskId) =>
   Markup.inlineKeyboard([
     [Markup.button.callback("➡️ Next Post", "nextpost_views")],
     [Markup.button.callback("❌ Report", `postreport_${taskId}`)],
+    [Markup.button.callback("⬅️ Back", "menu_earn")],
+  ]);
+
+// Shown after tapping a task in the 🤖 Bots list — the PR GRAM-style task
+// detail screen. "Go to the Bot" is a URL button (Telegram can't run our
+// code on tap of a URL button), so the caller already puts the worker into
+// "awaiting_proof_photo" the moment this screen is shown, before they even
+// leave — sending a screenshot back here is what actually submits it.
+export const botTaskDetailMenu = (task, link) =>
+  Markup.inlineKeyboard([
+    [Markup.button.url("🤖 Go to the Bot", link || "https://t.me")],
+    [Markup.button.callback("🙈 Hide task", `bothide_${task._id}`)],
+    [Markup.button.callback("❌ Report", `botreport_${task._id}`)],
+    [Markup.button.callback("⬅️ Back", "earn_bot")],
+  ]);
+
+// Sent right after a worker submits their screenshot for a bot task —
+// "Next Bot" jumps straight to the next unseen bot task (nextbot_bot in
+// bot.js), matching the "Completion #N sent... / Next Bot" flow.
+export const afterBotSubmitMenu = () =>
+  Markup.inlineKeyboard([
+    [Markup.button.callback("➡️ Next Bot", "nextbot_bot")],
     [Markup.button.callback("⬅️ Back", "menu_earn")],
   ]);
 

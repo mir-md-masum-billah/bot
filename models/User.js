@@ -41,6 +41,10 @@ const UserSchema = new mongoose.Schema(
     // the regular every-ANTI_BOT_CHECK_INTERVAL re-verification.
     totalTasksCompleted: { type: Number, default: 0 },
 
+    // Bot tasks the user tapped "🙈 Hide task" on — excluded from their own
+    // 🤖 Bots list from then on (doesn't affect other workers).
+    hiddenBotTaskIds: { type: [mongoose.Schema.Types.ObjectId], default: [] },
+
     // Simple in-memory-style state machine for multi-step bot flows
     // (e.g. "waiting for subscriber count", "waiting for chat forward")
     sessionState: { type: String, default: null },
