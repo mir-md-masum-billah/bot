@@ -272,10 +272,14 @@ export async function penalizeAndWarn(penalizeTelegramId, task, reason) {
   );
 }
 
-// Shared by: owner tapping ❌ Reject, and an admin override that turns an
-// already-approved/auto-approved submission back into a rejection. Always
-// penalizes the WORKER (the one who submitted the fake/invalid proof) and
-// always leaves the submission's final status as "rejected".
+// Shared by: owner tapping ❌ Reject, and an admin override. `penalizeTelegramId`
+// is only passed when the worker had ALREADY been paid for this submission
+// (an admin reversing a prior approval) — that's the one case where coins
+// need to be clawed back. An ordinary reject of a still-`pending`
+// submission (the owner's first look at it, before any payout happened)
+// passes `null` here: there's nothing to claw back, so the worker is just
+// notified of the rejection and the reason, with no balance change.
+// Always leaves the submission's final status as "rejected".
 export async function applyRejectionPenalty(submission, reason, penalizeTelegramId, decidedBy) {
   await dbConnect();
   const task = await Task.findById(submission.taskId);
@@ -287,10 +291,19 @@ export async function applyRejectionPenalty(submission, reason, penalizeTelegram
   await submission.save();
 
   if (penalizeTelegramId && task) {
+    // Worker had already been paid for this — claw the coins back.
     await penalizeAndWarn(
       penalizeTelegramId,
       task,
       `Your submission was rejected. Reason: ${submission.rejectReason}`
+    );
+  } else if (task) {
+    // Never paid in the first place — just let the worker know why, with
+    // no deduction.
+    await notifyWorker(
+      submission.workerTelegramId,
+      `❌ Your screenshot for "${task.targetChatTitle || task.targetChatId}" was rejected.\n` +
+        `Reason: ${submission.rejectReason}`
     );
   }
   return { ok: true };
@@ -2868,7 +2881,9 @@ bot.on("text", async (ctx) => {
       await ctx.reply("That submission isn't waiting on you anymore.");
       return;
     }
-    await applyRejectionPenalty(submission, text.slice(0, 300), submission.workerTelegramId, "owner");
+    // Still "pending" — the worker was never paid for this submission, so
+    // there's nothing to claw back (see applyRejectionPenalty above).
+    await applyRejectionPenalty(submission, text.slice(0, 300), null, "owner");
     await clearSession(user);
     await ctx.reply("❌ Rejected. The worker has been notified with your reason.");
     return;
