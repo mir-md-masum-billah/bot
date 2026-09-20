@@ -28,6 +28,21 @@ const UserSchema = new mongoose.Schema(
     // Master switch for bot notifications (task finished, report, clawback).
     notificationsEnabled: { type: Boolean, default: true },
     isBanned: { type: Boolean, default: false },
+    // Set from the admin dashboard when banning; shown to the user and kept
+    // for the audit trail.
+    banReason: { type: String, default: "" },
+    bannedAt: { type: Date, default: null },
+    // Private admin-only notes about this user (never shown to the user).
+    adminNotes: {
+      type: [
+        {
+          text: { type: String, required: true },
+          by: { type: String, default: "admin" },
+          createdAt: { type: Date, default: Date.now },
+        },
+      ],
+      default: [],
+    },
 
     // Anti-bot "human verification" (drag-puzzle captcha). Users start
     // verified; after every ANTI_BOT_CHECK_INTERVAL completed earn-checks
@@ -40,10 +55,6 @@ const UserSchema = new mongoose.Schema(
     // verification right after it (see verify_ handler in bot.js) on top of
     // the regular every-ANTI_BOT_CHECK_INTERVAL re-verification.
     totalTasksCompleted: { type: Number, default: 0 },
-
-    // Bot tasks the user tapped "🙈 Hide task" on — excluded from their own
-    // 🤖 Bots list from then on (doesn't affect other workers).
-    hiddenBotTaskIds: { type: [mongoose.Schema.Types.ObjectId], default: [] },
 
     // Simple in-memory-style state machine for multi-step bot flows
     // (e.g. "waiting for subscriber count", "waiting for chat forward")
