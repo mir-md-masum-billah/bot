@@ -40,27 +40,7 @@ export const earnTypeMenu = (counts = {}) => {
   ]);
 };
 
-// Shown right after "🤖 Bot" is picked in 📢 Promote, so the user actually
-// picks WHICH bot is being promoted before anything else. There's no Bot
-// API call that lists "bots this user owns/has chatted with" — the only
-// way to offer a real picker is Telegram's own `request_users` button
-// (KeyboardButtonRequestUsers), filtered to bots only. Once the user picks
-// one there, Telegram sends this bot a `users_shared` service message with
-// its id (and, since request_username/request_name are set below, its
-// @username and display name too — no extra getChat call needed).
-export const botRequestReplyMenu = () =>
-  Markup.keyboard([
-    [
-      Markup.button.userRequest("🤖 Choose bot", 1, {
-        user_is_bot: true,
-        request_name: true,
-        request_username: true,
-      }),
-    ],
-    ["⬅️ Back"],
-  ]).resize();
-
-// Shown right after a bot has been picked, mirroring PR GRAM's
+// Shown right after "🤖 Bot" is picked in 📢 Promote, mirroring PR GRAM's
 // "Choose the task type" step.
 export const botTaskTypeMenu = () =>
   Markup.keyboard([

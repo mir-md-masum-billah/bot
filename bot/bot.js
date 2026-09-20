@@ -10,6 +10,7 @@ import {
   mainMenu,
   replyMainMenu,
   earnTypeMenu,
+  subscriberCountMenu,
   cabinetMenu,
   myTasksMenu,
   taskDetailMenu,
@@ -36,7 +37,6 @@ import {
   addBotToChannelMenu,
   afterViewMenu,
   reportReasonMenu,
-  botRequestReplyMenu,
   botTaskTypeMenu,
   submissionReviewMenu,
 } from "./keyboards.js";
@@ -272,14 +272,10 @@ export async function penalizeAndWarn(penalizeTelegramId, task, reason) {
   );
 }
 
-// Shared by: owner tapping ❌ Reject, and an admin override. `penalizeTelegramId`
-// is only passed when the worker had ALREADY been paid for this submission
-// (an admin reversing a prior approval) — that's the one case where coins
-// need to be clawed back. An ordinary reject of a still-`pending`
-// submission (the owner's first look at it, before any payout happened)
-// passes `null` here: there's nothing to claw back, so the worker is just
-// notified of the rejection and the reason, with no balance change.
-// Always leaves the submission's final status as "rejected".
+// Shared by: owner tapping ❌ Reject, and an admin override that turns an
+// already-approved/auto-approved submission back into a rejection. Always
+// penalizes the WORKER (the one who submitted the fake/invalid proof) and
+// always leaves the submission's final status as "rejected".
 export async function applyRejectionPenalty(submission, reason, penalizeTelegramId, decidedBy) {
   await dbConnect();
   const task = await Task.findById(submission.taskId);
@@ -291,19 +287,10 @@ export async function applyRejectionPenalty(submission, reason, penalizeTelegram
   await submission.save();
 
   if (penalizeTelegramId && task) {
-    // Worker had already been paid for this — claw the coins back.
     await penalizeAndWarn(
       penalizeTelegramId,
       task,
       `Your submission was rejected. Reason: ${submission.rejectReason}`
-    );
-  } else if (task) {
-    // Never paid in the first place — just let the worker know why, with
-    // no deduction.
-    await notifyWorker(
-      submission.workerTelegramId,
-      `❌ Your screenshot for "${task.targetChatTitle || task.targetChatId}" was rejected.\n` +
-        `Reason: ${submission.rejectReason}`
     );
   }
   return { ok: true };
@@ -768,10 +755,8 @@ bot.action("menu_cabinet", async (ctx) => {
 // real app's style — see keyboards.js for the button layouts.
 
 // Types that need a target channel/group picked via Telegram's native
-// `request_chat` flow. "bot" targets another bot (not a chat), so it uses
-// its own native picker instead — `request_users` filtered to bots (see
-// "choosing_bot_target" below) — since a bot can't be added as a chat
-// admin the way a channel/group can.
+// `request_chat` flow. "bot" targets another bot (not a chat), so it keeps
+// the simpler legacy price->count->@username flow further below instead.
 // "views" is NOT here: a post task needs one specific message, and the chat
 // picker only returns a chat id. It uses the forward-the-post flow instead
 // (see startPostWizard / the forwarded-post middleware below).
@@ -807,27 +792,6 @@ async function renderWizardStep(ctx, user, state) {
       await ctx.reply(
         "📢 Choose a chat or channel to promote (the bot must be an admin)",
         adminStatusReplyMenu(d.type)
-      );
-      return;
-    case "choosing_bot_target":
-      await ctx.reply(
-        "🤖 Choose the bot you want to promote\n\n" +
-          "❓ What should you know?\n" +
-          "• Only bots with a public @username can be promoted.\n" +
-          "• A user can complete a task for this bot only once.",
-        botRequestReplyMenu()
-      );
-      return;
-    case "choosing_bot_task_type":
-      await ctx.reply(
-        `🤖 @${d.targetChatUsername} selected.\n\n` +
-          "Choose the task type:\n\n" +
-          "▶️ Bot start only — the worker opens the bot and presses Start. " +
-          "No other actions, and Check pays out instantly.\n\n" +
-          "📝 With additional conditions — you can request additional actions " +
-          "(e.g. subscribing to sponsors). The worker must send a screenshot, " +
-          "and it's only paid once approved.",
-        botTaskTypeMenu()
       );
       return;
     case "awaiting_post_forward":
@@ -879,7 +843,7 @@ async function renderWizardStep(ctx, user, state) {
       return;
     case "wizard_awaiting_price": {
       const min = computeMinPrice(d.audienceMode, d.languages);
-      const unit = d.type === "views" ? "view" : d.type === "bot" ? "bot visit" : "subscription";
+      const unit = d.type === "views" ? "view" : "subscription";
       await ctx.reply(
         `💲 Set the price for 1 ${unit} — this is the worker's reward.\n\n` +
           `Minimum — ${min} GRAM\n` +
@@ -892,11 +856,10 @@ async function renderWizardStep(ctx, user, state) {
     case "wizard_choosing_count": {
       const total = user.donatedBalance + user.earnedBalance;
       const maxForBalance = maxAffordable(user, d.price);
-      const unit = d.type === "views" ? "views" : d.type === "bot" ? "completions" : "subscriptions";
-      const priceLabel = d.type === "views" ? "View" : d.type === "bot" ? "Bot visit" : "Subscription";
+      const unit = d.type === "views" ? "views" : "subscriptions";
       await ctx.reply(
         `ℹ️ Task creation commission — ${COMMISSION_PERCENT}%.\n\n` +
-          `💵 ${priceLabel} price — ${d.price} GRAM\n` +
+          `💵 ${d.type === "views" ? "View" : "Subscription"} price — ${d.price} GRAM\n` +
           `💰 Your balance — ${total.toLocaleString()} GRAM\n\n` +
           `📝 Enter the number of ${unit} or choose:`,
         countMenu(maxForBalance)
@@ -1105,63 +1068,39 @@ bot.hears("⚡️ Premium boost (channel)", (ctx) => startChatPickerWizard(ctx, 
 bot.hears("❤️ Reactions", (ctx) => startChatPickerWizard(ctx, "reactions"));
 
 // "Bot" promotion targets another bot, not a chat, so `request_chat` doesn't
-// apply. Instead, the user must actually pick WHICH bot first — the exact
-// thing that was missing before: this used to jump straight to "choosing
-// the task type" (and then straight to "send the price") without ever
-// asking which bot the task is even for, so the owner had no way to tell
-// which bot they'd just "selected". Now: pick the bot (native picker) ->
-// pick the task type -> (existing generic wizard) audience -> price ->
-// count -> payment -> publish.
+// apply — it keeps the simpler legacy price → count → @username flow that
+// already existed (see the "awaiting_price"/"awaiting_chat" branches below).
 bot.hears("🤖 Bot", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   if (user.sessionState !== "promote_type_menu") return;
   await tryDeleteUserMessage(ctx);
-  await goForward(user, "choosing_bot_target", { type: "bot" });
-  await renderWizardStep(ctx, user, "choosing_bot_target");
-});
-
-// Fired once the user actually picks a bot from the "🤖 Choose bot" native
-// picker. `request_username`/`request_name` were requested on that button,
-// so the bot's @username and display name arrive directly here — no extra
-// getChat call (and no guessing) needed.
-bot.on(message("users_shared"), async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  if (user.sessionState !== "choosing_bot_target") return;
-
-  const picked = ctx.message.users_shared?.users?.[0];
-  if (!picked) {
-    await ctx.reply('Couldn\'t read that selection — please tap "Choose bot" again.');
-    return;
-  }
-  if (!picked.username) {
-    await ctx.reply(
-      "That bot has no public @username, so it can't be promoted. Please choose a different bot."
-    );
-    return;
-  }
-
-  await tryDeleteUserMessage(ctx);
-  await goForward(user, "choosing_bot_task_type", {
-    targetChatId: String(picked.user_id),
-    targetChatTitle: picked.first_name || `@${picked.username}`,
-    targetChatUsername: picked.username,
-  });
-  await renderWizardStep(ctx, user, "choosing_bot_task_type");
+  await setSession(user, "choosing_bot_task_type", { type: "bot" });
+  await ctx.reply(
+    "🤖 Choose the task type:\n\n" +
+      "▶️ Bot start only — the worker opens the bot and presses Start. No other actions, and Check pays out instantly.\n\n" +
+      "📝 With additional conditions — you can request additional actions (e.g. subscribing to sponsors). " +
+      "The worker must send a screenshot, and it's only paid once approved.",
+    botTaskTypeMenu()
+  );
 });
 
 bot.hears("▶️ Bot start only", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   if (user.sessionState !== "choosing_bot_task_type") return;
   await tryDeleteUserMessage(ctx);
-  await goForward(user, "choosing_audience_main", { requiresProof: false, conditionText: "" });
-  await renderWizardStep(ctx, user, "choosing_audience_main");
+  await setSession(user, "awaiting_price", { type: "bot", requiresProof: false });
+  await ctx.reply(
+    `${TYPE_LABELS.bot} selected.\n\n` +
+      `💡 Send the price (in coins) you want to pay per completion.\n` +
+      `Tip: check the "Earn" section for current prices — higher prices get completed faster.`
+  );
 });
 
 bot.hears("📝 With additional conditions", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   if (user.sessionState !== "choosing_bot_task_type") return;
   await tryDeleteUserMessage(ctx);
-  await setSession(user, "awaiting_bot_condition_text", user.sessionData);
+  await setSession(user, "awaiting_bot_condition_text", { type: "bot", requiresProof: true });
   await ctx.reply(
     "📝 Describe the task conditions — what the worker must do after starting the bot. " +
       "For example: press a button, complete a captcha, subscribe to sponsors.\n\n" +
@@ -1409,8 +1348,6 @@ async function createWizardTask(ctx, user, paymentMethod) {
     paymentMethod,
     pricePerAction: d.price,
     goalCount: d.count,
-    requiresProof: Boolean(d.requiresProof),
-    conditionText: d.conditionText || "",
   });
 
   await clearSession(user);
@@ -1442,7 +1379,6 @@ async function findMergeableTask(ownerTelegramId, d) {
     linkType: d.linkType,
     audienceMode: d.audienceMode,
     pricePerAction: d.price,
-    requiresProof: Boolean(d.requiresProof),
     status: { $in: ["active", "completed"] },
   };
   if (d.type === "views") {
@@ -2861,16 +2797,49 @@ bot.on("text", async (ctx) => {
     return;
   }
 
+  if (state === "awaiting_price") {
+    const price = Number(text);
+    if (!Number.isFinite(price) || price <= 0) {
+      await ctx.reply("Please send a valid positive number for the price.");
+      return;
+    }
+    await setSession(user, "awaiting_count", { ...user.sessionData, price });
+    await ctx.reply(
+      "Choose how many subscribers/views/completions you want:",
+      subscriberCountMenu()
+    );
+    return;
+  }
+
+  if (state === "awaiting_custom_count") {
+    const count = parseInt(text, 10);
+    if (!Number.isFinite(count) || count <= 0) {
+      await ctx.reply("Please send a valid positive whole number.");
+      return;
+    }
+    await finalizeCount(ctx, user, count);
+    return;
+  }
+
+  if (state === "awaiting_chat") {
+    await handleChatInput(ctx, user, ctx.message);
+    return;
+  }
+
   if (state === "awaiting_bot_condition_text") {
     if (text.length > 400) {
       await ctx.reply("Too long — please keep it under 400 characters.");
       return;
     }
-    await goForward(user, "choosing_audience_main", {
-      requiresProof: true,
+    await setSession(user, "awaiting_price", {
+      ...user.sessionData,
       conditionText: text,
     });
-    await renderWizardStep(ctx, user, "choosing_audience_main");
+    await ctx.reply(
+      `${TYPE_LABELS.bot} (with additional conditions) selected.\n\n` +
+        `💡 Send the price (in coins) you want to pay per completion — screenshots are reviewed, so ` +
+        `pricing a bit above the "Bot start only" minimum tends to get done faster.`
+    );
     return;
   }
 
@@ -2881,9 +2850,7 @@ bot.on("text", async (ctx) => {
       await ctx.reply("That submission isn't waiting on you anymore.");
       return;
     }
-    // Still "pending" — the worker was never paid for this submission, so
-    // there's nothing to claw back (see applyRejectionPenalty above).
-    await applyRejectionPenalty(submission, text.slice(0, 300), null, "owner");
+    await applyRejectionPenalty(submission, text.slice(0, 300), submission.workerTelegramId, "owner");
     await clearSession(user);
     await ctx.reply("❌ Rejected. The worker has been notified with your reason.");
     return;
@@ -3061,5 +3028,149 @@ bot.action(/submission_reject_(.+)/, async (ctx) => {
   await ctx.answerCbQuery();
   await ctx.reply("✏️ Send the reason for rejecting this submission (the worker will see it).");
 });
+
+bot.action("count_custom", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await setSession(user, "awaiting_custom_count", user.sessionData);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("✏️ Send the exact number you want:");
+});
+
+bot.action(/count_(\d+)/, async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  await ctx.answerCbQuery();
+  await finalizeCount(ctx, user, Number(ctx.match[1]));
+});
+
+async function finalizeCount(ctx, user, count) {
+  const { type, price, requiresProof, conditionText } = user.sessionData;
+  const totalCost = price * count;
+  const available = user.donatedBalance + user.earnedBalance;
+
+  if (!Number.isFinite(totalCost)) {
+    await clearSession(user);
+    await ctx.reply("⚠️ Something went wrong with your task details. Please start over.", mainMenu());
+    return;
+  }
+
+  if (available < totalCost) {
+    await clearSession(user);
+    await ctx.reply(
+      `❌ Insufficient balance. This task needs up to ${totalCost} coins ` +
+        `(plus commission if paid from earned coins). Your balance: ${available}.`,
+      mainMenu()
+    );
+    return;
+  }
+
+  await setSession(user, "awaiting_chat", { type, price, count, requiresProof, conditionText });
+  await ctx.reply(
+    "📌 Now add me as an admin to the chat you want to promote, then:\n" +
+      "• Forward any message from that channel/group here, OR\n" +
+      "• Send its @username\n\n" +
+      "🏠 If it's your own chat, I can request admin rights automatically once you forward a message from it.\n" +
+      "🌐 If it's not your chat, grant me admin rights manually first."
+  );
+}
+
+async function handleChatInput(ctx, user, message) {
+  let chatId = null;
+  let chatUsername = null;
+
+  if (message.forward_from_chat) {
+    chatId = message.forward_from_chat.id;
+    chatUsername = message.forward_from_chat.username;
+  } else if (message.text && message.text.startsWith("@")) {
+    chatUsername = message.text;
+    chatId = message.text; // Telegram API accepts @username as chat id for public chats
+  } else {
+    await ctx.reply("Please forward a message from the chat, or send its @username.");
+    return;
+  }
+
+  const adminOk = await isBotAdminIn(chatId);
+  if (!adminOk) {
+    await ctx.reply(
+      "⚠️ I'm not an admin there yet. Please add me as an administrator " +
+        "(with 'invite users via link' permission) and send the chat again."
+    );
+    return;
+  }
+
+  let chatInfo;
+  try {
+    chatInfo = await bot.telegram.getChat(chatId);
+  } catch (e) {
+    await ctx.reply("Couldn't read that chat. Please try again.");
+    return;
+  }
+
+  await dbConnect();
+  const { type, price, count, requiresProof, conditionText } = user.sessionData;
+  const spend = await spendForTask(user, price * count);
+  if (!spend.ok) {
+    if (spend.invalid) {
+      await clearSession(user);
+      await ctx.reply("⚠️ Something went wrong with your task details. Please start over.", mainMenu());
+    } else {
+      await ctx.reply(`❌ Insufficient balance. Needed: ${spend.needed} coins.`);
+    }
+    return;
+  }
+
+  // Same "don't publish a duplicate" rule as the main wizard: fold into an
+  // existing active/completed task for this exact chat + price if the
+  // owner already has one, instead of creating a second one.
+  const existing = await Task.findOne({
+    ownerTelegramId: user.telegramId,
+    type,
+    targetChatId: String(chatId),
+    pricePerAction: price,
+    requiresProof: Boolean(requiresProof),
+    status: { $in: ["active", "completed"] },
+  });
+
+  if (existing) {
+    existing.goalCount += count;
+    if (existing.status === "completed") existing.status = "active";
+    await existing.save();
+
+    await clearSession(user);
+    await ctx.reply(
+      `✅ Added to your existing task instead of creating a duplicate!\n\n` +
+        `${TYPE_LABELS[type]} — ${existing.targetChatTitle || chatInfo.title || chatUsername}\n` +
+        `+${count} more requested (goal now ${existing.goalCount.toLocaleString()}, ` +
+        `${existing.completedCount.toLocaleString()} already completed)\n` +
+        `Price: ${price} coins × ${count} = ${price * count} coins` +
+        (spend.commission ? ` (+${spend.commission} commission)` : "") +
+        `\n\nTrack it under 🗂 My Cabinet → My Tasks.`,
+      mainMenu()
+    );
+    return;
+  }
+
+  const task = await Task.create({
+    ownerTelegramId: user.telegramId,
+    taskNumber: await nextCounterValue("tasks", 1888000),
+    type,
+    targetChatId: String(chatId),
+    targetChatTitle: chatInfo.title,
+    targetChatUsername: chatInfo.username,
+    pricePerAction: price,
+    goalCount: count,
+    requiresProof: Boolean(requiresProof),
+    conditionText: conditionText || "",
+  });
+
+  await clearSession(user);
+  await ctx.reply(
+    `✅ Task created!\n\n` +
+      `${TYPE_LABELS[type]} — ${chatInfo.title || chatUsername}\n` +
+      `Price: ${price} coins × ${count} = ${price * count} coins` +
+      (spend.commission ? ` (+${spend.commission} commission)` : "") +
+      `\n\nTrack it under 🗂 My Cabinet → My Tasks.`,
+    mainMenu()
+  );
+}
 
 export default bot;
