@@ -1,9 +1,8 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/router";
-import { dbConnect } from "../../lib/db.js";
-import { isAuthed } from "../../lib/adminAuth.js";
 
 export async function getServerSideProps({ req }) {
+  const { isAuthed } = await import("../../lib/adminAuth.js");
   if (!isAuthed(req)) {
     return { redirect: { destination: "/admin/login", permanent: false } };
   }
@@ -26,10 +25,10 @@ export default function AdminDashboard() {
       fetch("/api/admin/users").then((r) => r.json()),
       fetch(`/api/admin/submissions${subFilter ? `?status=${subFilter}` : ""}`).then((r) => r.json()),
     ]);
-    setStats(s);
-    setTasks(t);
-    setUsers(u);
-    setSubmissions(sub);
+    setStats(s && !s.error ? s : null);
+    setTasks(Array.isArray(t) ? t : []);
+    setUsers(Array.isArray(u) ? u : []);
+    setSubmissions(Array.isArray(sub) ? sub : []);
   }
 
   useEffect(() => {
