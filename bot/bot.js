@@ -391,12 +391,17 @@ function extractForwardedPost(message) {
 // N updates (often handled by N parallel serverless invocations), so:
 //   1. every part is recorded in PostAlbum, and the invocation that created
 //      the record waits ALBUM_COLLECT_MS and reads the complete id list
-//      (see the forwarded-post middleware below);
+//      (see the forwarded-post middleware below). Parts that still trickle in
+//      later are recorded too, and the list is read one final time when the
+//      task is published (createWizardTask), so nothing depends on timing;
 //   2. the task stores ALL those ids (Task.targetMessageIds);
 //   3. every worker gets them via forwardMessages, which delivers them again
 //      as ONE album with the "Forwarded from <channel>" header.
 // ---------------------------------------------------------------------------
 const ALBUM_COLLECT_MS = 1500;
+// A part that arrives for an album record older than this is a fresh forward
+// of the same album (a retry), not a straggler of the one being collected.
+const ALBUM_RETRY_MS = 15000;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Unique + strictly increasing — the order forwardMessages requires.
@@ -453,6 +458,26 @@ async function recordAlbumPart(telegramId, mediaGroupId, chatId, messageId) {
     await PostAlbum.updateOne(filter, { $addToSet: { messageIds: messageId } });
     return { isFirst: false };
   }
+}
+
+// Final id list for an album: everything recorded in PostAlbum plus whatever
+// the session already holds. The fallback ids keep working if the record is
+// gone (expired), so a task can always be created.
+async function loadAlbumIds(telegramId, mediaGroupId, fallbackIds = []) {
+  let recorded = [];
+  if (mediaGroupId) {
+    const album = await PostAlbum.findOne({
+      telegramId,
+      mediaGroupId: String(mediaGroupId),
+    }).lean();
+    recorded = album?.messageIds || [];
+  }
+  return normalizeMessageIds([...fallbackIds, ...recorded]);
+}
+
+async function deleteAlbumRecord(telegramId, mediaGroupId) {
+  if (!mediaGroupId) return;
+  await PostAlbum.deleteOne({ telegramId, mediaGroupId: String(mediaGroupId) }).catch(() => {});
 }
 
 async function isUserMemberOf(chatId, userId) {
@@ -783,14 +808,25 @@ bot.use(async (ctx, next) => {
   // Several pictures forwarded together arrive as separate messages with the
   // same media_group_id. Only the first one carries on; it waits for the rest,
   // reads their ids from the database and handles the whole album at once.
-  // The others just record themselves and stop here.
+  // The others just record their id and stop here.
   if (groupId) {
     const albumFilter = { telegramId: user.telegramId, mediaGroupId: String(groupId) };
 
     if (user.sessionState !== "awaiting_post_forward") {
-      // A straggler of an album that's already being (or was just) handled.
-      if (await PostAlbum.exists(albumFilter)) return;
+      // A straggler of an album that was already picked up: keep its id, the
+      // final list is read again when the task is published.
+      if (await PostAlbum.exists(albumFilter)) {
+        await PostAlbum.updateOne(albumFilter, { $addToSet: { messageIds: post.messageId } });
+        return;
+      }
       return next();
+    }
+
+    // Same album forwarded again after a while (e.g. after "Check again") —
+    // start over instead of treating it as a straggler.
+    const existing = await PostAlbum.findOne(albumFilter).select("createdAt").lean();
+    if (existing && Date.now() - new Date(existing.createdAt).getTime() > ALBUM_RETRY_MS) {
+      await PostAlbum.deleteOne(albumFilter);
     }
 
     const { isFirst } = await recordAlbumPart(
@@ -801,16 +837,12 @@ bot.use(async (ctx, next) => {
     );
     if (!isFirst) return;
 
-    try {
-      await sleep(ALBUM_COLLECT_MS);
-      const album = await PostAlbum.findOne(albumFilter).lean();
-      post.messageIds = normalizeMessageIds(album?.messageIds?.length ? album.messageIds : [post.messageId]);
-      user = await getOrCreateUser(ctx); // state may have changed while waiting
-      if (user.sessionState !== "awaiting_post_forward") return;
-      await handlePostForward(ctx, user, post);
-    } finally {
-      await PostAlbum.deleteOne(albumFilter).catch(() => {});
-    }
+    await sleep(ALBUM_COLLECT_MS);
+    post.messageIds = await loadAlbumIds(user.telegramId, groupId, [post.messageId]);
+    post.mediaGroupId = String(groupId);
+    user = await getOrCreateUser(ctx); // state may have changed while waiting
+    if (user.sessionState !== "awaiting_post_forward") return;
+    await handlePostForward(ctx, user, post);
     return;
   }
 
@@ -831,6 +863,7 @@ async function handlePostForward(ctx, user, post) {
       pendingChatId: String(post.chatId),
       pendingMessageId: messageIds[0],
       pendingMessageIds: messageIds,
+      pendingMediaGroupId: post.mediaGroupId,
       pendingTitle: post.title,
       pendingUsername: post.username,
     });
@@ -870,6 +903,7 @@ async function handlePostForward(ctx, user, post) {
     targetChatUsername: post.username,
     targetMessageId: messageIds[0],
     targetMessageIds: messageIds,
+    targetMediaGroupId: post.mediaGroupId,
     linkType: "regular",
   });
   if (messageIds.length > 1) {
@@ -897,7 +931,13 @@ bot.action("postadmin_recheck", async (ctx) => {
   await handlePostForward(ctx, user, {
     chatId: d.pendingChatId,
     messageId: d.pendingMessageId,
-    messageIds: d.pendingMessageIds,
+    // Parts that arrived after the first check are picked up here.
+    messageIds: await loadAlbumIds(
+      user.telegramId,
+      d.pendingMediaGroupId,
+      d.pendingMessageIds || [d.pendingMessageId]
+    ),
+    mediaGroupId: d.pendingMediaGroupId,
     title: d.pendingTitle,
     username: d.pendingUsername,
   });
@@ -1063,6 +1103,19 @@ async function proceedAfterPaymentChoice(ctx, user, method) {
 // successful_payment handler instead, once Telegram confirms the charge.
 async function createWizardTask(ctx, user, paymentMethod) {
   const d = user.sessionData;
+  // Last chance to pick up album parts that were recorded after the wizard
+  // moved on (see the forwarded-post middleware).
+  if (d.type === "views" && d.targetMediaGroupId) {
+    const ids = await loadAlbumIds(
+      user.telegramId,
+      d.targetMediaGroupId,
+      d.targetMessageIds || [d.targetMessageId]
+    );
+    if (ids.length) {
+      d.targetMessageIds = ids;
+      d.targetMessageId = ids[0];
+    }
+  }
   const totalGram = d.price * d.count;
 
   // A post task lives or dies on the bot still being an admin in the source
@@ -1115,6 +1168,7 @@ async function createWizardTask(ctx, user, paymentMethod) {
     await mergeTarget.save();
 
     await clearSession(user);
+    await deleteAlbumRecord(user.telegramId, d.targetMediaGroupId);
     await ctx.reply(
       `✅ Added to your existing task instead of creating a duplicate!\n\n` +
         `${TYPE_LABELS[d.type]} — ${mergeTarget.targetChatTitle || d.targetChatTitle}\n` +
@@ -1148,9 +1202,12 @@ async function createWizardTask(ctx, user, paymentMethod) {
   });
 
   await clearSession(user);
+  await deleteAlbumRecord(user.telegramId, d.targetMediaGroupId);
+  const pictureCount = normalizeMessageIds(d.targetMessageIds).length;
   await ctx.reply(
     `✅ Task published!\n\n` +
       `${TYPE_LABELS[d.type]} — ${d.targetChatTitle}\n` +
+      (pictureCount > 1 ? `📸 ${pictureCount} pictures (shown together)\n` : "") +
       `Price: ${d.price} GRAM × ${d.count} = ${totalGram} GRAM` +
       (commission ? ` (+${commission} commission)` : "") +
       (inviteLink ? `\n🔗 Link: ${inviteLink}` : "") +
