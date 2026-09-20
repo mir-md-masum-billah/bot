@@ -3,6 +3,7 @@ import { message } from "telegraf/filters";
 import { dbConnect } from "../lib/db.js";
 import User from "../models/User.js";
 import Task from "../models/Task.js";
+import PostAlbum from "../models/PostAlbum.js";
 import Transaction from "../models/Transaction.js";
 import {
   mainMenu,
@@ -382,6 +383,78 @@ function extractForwardedPost(message) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-picture posts ("albums")
+//
+// A channel post with several pictures is really N separate Telegram messages
+// that share a `media_group_id`. When an advertiser forwards it, the bot gets
+// N updates (often handled by N parallel serverless invocations), so:
+//   1. every part is recorded in PostAlbum, and the invocation that created
+//      the record waits ALBUM_COLLECT_MS and reads the complete id list
+//      (see the forwarded-post middleware below);
+//   2. the task stores ALL those ids (Task.targetMessageIds);
+//   3. every worker gets them via forwardMessages, which delivers them again
+//      as ONE album with the "Forwarded from <channel>" header.
+// ---------------------------------------------------------------------------
+const ALBUM_COLLECT_MS = 1500;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Unique + strictly increasing — the order forwardMessages requires.
+function normalizeMessageIds(ids) {
+  return [...new Set((ids || []).map(Number).filter((n) => Number.isFinite(n) && n > 0))].sort(
+    (a, b) => a - b
+  );
+}
+
+// The ids to forward for a task. Tasks created before album support only
+// have `targetMessageId`.
+function getTaskMessageIds(task) {
+  const ids = normalizeMessageIds(task.targetMessageIds);
+  if (ids.length) return ids;
+  return task.targetMessageId ? [task.targetMessageId] : [];
+}
+
+// Forwards one post (1..N messages) and returns the ids of the copies that
+// landed in the target chat. Several ids go through forwardMessages so they
+// arrive grouped as a single album; Telegram silently skips messages it can't
+// find, so an empty result means the post is gone and is treated as a failure.
+async function forwardPostMessages(toChatId, fromChatId, messageIds, extra = {}) {
+  const ids = normalizeMessageIds(messageIds);
+  if (!ids.length) throw new Error("no message ids to forward");
+  if (ids.length === 1) {
+    const sent = await bot.telegram.forwardMessage(toChatId, fromChatId, ids[0], extra);
+    return [sent.message_id];
+  }
+  const sent = await bot.telegram.forwardMessages(toChatId, fromChatId, ids, extra);
+  if (!Array.isArray(sent) || sent.length === 0) {
+    throw new Error("none of the post's messages could be forwarded");
+  }
+  return sent.map((m) => m.message_id);
+}
+
+// Adds one album part to the shared record. Returns { isFirst: true } for the
+// update that created the record (it becomes the "collector") and false for
+// every other part. The unique index makes two simultaneous first parts safe:
+// the loser gets a duplicate-key error and simply counts as a later part.
+async function recordAlbumPart(telegramId, mediaGroupId, chatId, messageId) {
+  const filter = { telegramId, mediaGroupId: String(mediaGroupId) };
+  try {
+    const previous = await PostAlbum.findOneAndUpdate(
+      filter,
+      {
+        $addToSet: { messageIds: messageId },
+        $setOnInsert: { chatId: String(chatId), createdAt: new Date() },
+      },
+      { upsert: true, new: false }
+    );
+    return { isFirst: !previous };
+  } catch (e) {
+    if (e?.code !== 11000) throw e;
+    await PostAlbum.updateOne(filter, { $addToSet: { messageIds: messageId } });
+    return { isFirst: false };
+  }
+}
+
 async function isUserMemberOf(chatId, userId) {
   try {
     const member = await bot.telegram.getChatMember(chatId, userId);
@@ -704,12 +777,51 @@ bot.hears("👁 Post", startPostWizard);
 bot.use(async (ctx, next) => {
   const post = ctx.message && extractForwardedPost(ctx.message);
   if (!post) return next();
-  const user = await getOrCreateUser(ctx);
+  let user = await getOrCreateUser(ctx);
+  const groupId = ctx.message.media_group_id;
+
+  // Several pictures forwarded together arrive as separate messages with the
+  // same media_group_id. Only the first one carries on; it waits for the rest,
+  // reads their ids from the database and handles the whole album at once.
+  // The others just record themselves and stop here.
+  if (groupId) {
+    const albumFilter = { telegramId: user.telegramId, mediaGroupId: String(groupId) };
+
+    if (user.sessionState !== "awaiting_post_forward") {
+      // A straggler of an album that's already being (or was just) handled.
+      if (await PostAlbum.exists(albumFilter)) return;
+      return next();
+    }
+
+    const { isFirst } = await recordAlbumPart(
+      user.telegramId,
+      groupId,
+      post.chatId,
+      post.messageId
+    );
+    if (!isFirst) return;
+
+    try {
+      await sleep(ALBUM_COLLECT_MS);
+      const album = await PostAlbum.findOne(albumFilter).lean();
+      post.messageIds = normalizeMessageIds(album?.messageIds?.length ? album.messageIds : [post.messageId]);
+      user = await getOrCreateUser(ctx); // state may have changed while waiting
+      if (user.sessionState !== "awaiting_post_forward") return;
+      await handlePostForward(ctx, user, post);
+    } finally {
+      await PostAlbum.deleteOne(albumFilter).catch(() => {});
+    }
+    return;
+  }
+
   if (user.sessionState !== "awaiting_post_forward") return next();
   await handlePostForward(ctx, user, post);
 });
 
 async function handlePostForward(ctx, user, post) {
+  // One id for a normal post, several for a multi-picture album.
+  const messageIds = normalizeMessageIds(post.messageIds || [post.messageId]);
+
   // 1) Is the bot an admin in the channel this post came from? Without it,
   //    forwardMessage to workers fails later — so it's checked up front,
   //    before the user spends anything.
@@ -717,7 +829,8 @@ async function handlePostForward(ctx, user, post) {
     await setSession(user, "awaiting_post_forward", {
       ...user.sessionData,
       pendingChatId: String(post.chatId),
-      pendingMessageId: post.messageId,
+      pendingMessageId: messageIds[0],
+      pendingMessageIds: messageIds,
       pendingTitle: post.title,
       pendingUsername: post.username,
     });
@@ -734,10 +847,14 @@ async function handlePostForward(ctx, user, post) {
   //    forwarding the post to the owner and deleting it again, rather than
   //    letting every worker hit the error after the task is paid for.
   try {
-    const probe = await bot.telegram.forwardMessage(ctx.chat.id, post.chatId, post.messageId, {
+    const probe = await forwardPostMessages(ctx.chat.id, post.chatId, messageIds, {
       disable_notification: true,
     });
-    await bot.telegram.deleteMessage(ctx.chat.id, probe.message_id).catch(() => {});
+    if (probe.length === 1) {
+      await bot.telegram.deleteMessage(ctx.chat.id, probe[0]).catch(() => {});
+    } else {
+      await bot.telegram.deleteMessages(ctx.chat.id, probe).catch(() => {});
+    }
   } catch (e) {
     await ctx.reply(
       `⛔️ I can't forward that post.\n\n` +
@@ -751,9 +868,13 @@ async function handlePostForward(ctx, user, post) {
     targetChatId: String(post.chatId),
     targetChatTitle: post.title,
     targetChatUsername: post.username,
-    targetMessageId: post.messageId,
+    targetMessageId: messageIds[0],
+    targetMessageIds: messageIds,
     linkType: "regular",
   });
+  if (messageIds.length > 1) {
+    await ctx.reply(`📸 Album detected — all ${messageIds.length} pictures will be shown to workers together.`);
+  }
   await renderWizardStep(ctx, user, "choosing_audience_main");
 }
 
@@ -776,6 +897,7 @@ bot.action("postadmin_recheck", async (ctx) => {
   await handlePostForward(ctx, user, {
     chatId: d.pendingChatId,
     messageId: d.pendingMessageId,
+    messageIds: d.pendingMessageIds,
     title: d.pendingTitle,
     username: d.pendingUsername,
   });
@@ -1016,6 +1138,7 @@ async function createWizardTask(ctx, user, paymentMethod) {
     targetChatUsername: d.targetChatUsername,
     targetInviteLink: inviteLink,
     targetMessageId: d.targetMessageId,
+    targetMessageIds: d.targetMessageIds || (d.targetMessageId ? [d.targetMessageId] : undefined),
     linkType: d.linkType,
     audienceMode: d.audienceMode,
     languages: d.languages || [],
@@ -1058,9 +1181,14 @@ async function findMergeableTask(ownerTelegramId, d) {
 
   const wantedLanguages = [...(d.languages || [])].sort();
   const candidates = await Task.find(query);
+  const wantedMessageCount = normalizeMessageIds(d.targetMessageIds).length || 1;
   return (
     candidates.find((t) => {
       const taskLanguages = [...(t.languages || [])].sort();
+      // Same first message but a different number of pictures is a different post.
+      if (d.type === "views" && (getTaskMessageIds(t).length || 1) !== wantedMessageCount) {
+        return false;
+      }
       return (
         taskLanguages.length === wantedLanguages.length &&
         taskLanguages.every((lang, i) => lang === wantedLanguages[i])
@@ -1844,7 +1972,8 @@ async function deliverViewTask(ctx, user, task) {
     await ctx.answerCbQuery("You already viewed this post.");
     return;
   }
-  if (!task.targetMessageId) {
+  const postMessageIds = getTaskMessageIds(task);
+  if (!postMessageIds.length) {
     await ctx.answerCbQuery("This task is missing its post — skipping it.");
     return;
   }
@@ -1858,7 +1987,9 @@ async function deliverViewTask(ctx, user, task) {
   // copying it) is what makes the view count for the owner AND keeps the
   // "Forwarded from <channel>" header, so the worker can see the source.
   try {
-    await bot.telegram.forwardMessage(user.telegramId, task.targetChatId, task.targetMessageId);
+    // A multi-picture post goes out in a single forwardMessages call so the
+    // worker gets all the pictures together, as one album.
+    await forwardPostMessages(user.telegramId, task.targetChatId, postMessageIds);
   } catch (e) {
     // Post deleted, or the bot was removed as admin. Pause the task so no
     // one else hits this, and tell the owner how to fix or refund it.

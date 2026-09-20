@@ -37,6 +37,14 @@ const TaskSchema = new mongoose.Schema(
     // the bot must be an admin in that channel before the task is created.
     targetMessageId: { type: Number },
 
+    // Every message of the post, in channel order. A post with several
+    // pictures is really one Telegram message per picture (an "album"), so
+    // ALL of their ids are kept here and forwarded to the worker in one go
+    // (forwardMessages keeps them grouped as a single album). For a normal
+    // single-message post this is just [targetMessageId]. Older tasks have
+    // no such field and fall back to targetMessageId.
+    targetMessageIds: { type: [Number], default: undefined },
+
     // Reports filed by workers who saw the post (adult/inappropriate
     // content, scam, etc). After REPORT_AUTO_PAUSE reports the task is
     // paused automatically and the owner is notified.

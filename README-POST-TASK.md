@@ -92,3 +92,46 @@ Telegram-এর picker শুধু **chat id** ফেরত দেয়, ক�
 balance" আসত। নতুন `maxAffordable()` কমিশন হিসাবের মধ্যে ধরে, তাই maximum
 বাটনটা সবসময় কাজ করে। (কমিশন শুধু earned coins-এর অংশে বসে — `spendForTask`
 অনুযায়ী।) কিবোর্ডের যেকোনো সংখ্যা বা হাতে টাইপ করা সংখ্যা — সবই এখন গ্রহণ করে।
+
+---
+
+# আপডেট ৩ — অনেকগুলো ছবির পোস্ট (Album) একসাথে ফরওয়ার্ড
+
+## সমস্যা কী ছিল
+
+চ্যানেলের যে পোস্টে একাধিক ছবি থাকে, Telegram সেটা আসলে **আলাদা আলাদা মেসেজ**
+(প্রতিটা ছবি একটা মেসেজ, সবার `media_group_id` এক) হিসেবে পাঠায়। আগে বট শুধু প্রথম
+মেসেজের id রাখত, তাই ওয়ার্কাররা পোস্টের **একটা ছবিই** পেত।
+
+## এখন কী হয়
+
+**অ্যাডভার্টাইজার পোস্ট ফরওয়ার্ড করলে:**
+1. প্রতিটা ছবির মেসেজ আসার সাথে সাথে `PostAlbum` কালেকশনে (`models/PostAlbum.js`)
+   তার id জমা হয় — Vercel-এ প্রতিটা মেসেজ আলাদা invocation-এ চলে, তাই মেমরি না,
+   ডাটাবেসই একমাত্র মিলনস্থল।
+2. যেটা প্রথম আসে সেটা `ALBUM_COLLECT_MS` (১.৫ সেকেন্ড) অপেক্ষা করে সব id পড়ে নেয়;
+   বাকিগুলো শুধু নিজের id জমা দিয়ে থেমে যায় (তাই "Forward the post" ধাপ একবারই চলে)।
+3. টেস্ট ফরওয়ার্ডও এখন **সব ছবি** একসাথে করে দেখে, তারপর মুছে দেয়।
+4. টাস্কে `targetMessageIds` (সব id, ক্রমানুসারে) সেভ হয়; `targetMessageId` আগের মতো
+   প্রথম id-ই থাকে, তাই পুরোনো কোড/ফিল্টার ভাঙে না।
+5. অ্যাডভার্টাইজারকে দেখায়: `📸 Album detected — all N pictures will be shown to workers together.`
+
+**ওয়ার্কার View Post চাপলে:** `forwardMessages` দিয়ে সব ছবি **একটাই কলে** ফরওয়ার্ড হয় —
+তাই ওয়ার্কার সবগুলো ছবি একসাথে album হিসেবে পায়, "Forwarded from <channel>" হেডারসহ,
+আর ভিউ আসল চ্যানেলে গোনা হয়।
+
+## এজ কেস
+
+- একটাই ছবি/সাধারণ পোস্ট হলে আগের মতোই `forwardMessage` চলে।
+- পুরোনো টাস্ক (যাতে `targetMessageIds` নেই) `targetMessageId` দিয়ে আগের মতো কাজ করে।
+- অ্যালবামের সব মেসেজ মুছে গেলে (`forwardMessages` খালি ফেরত দিলে) → আগের মতোই টাস্ক
+  auto-pause + মালিককে নোটিফিকেশন।
+- একই প্রথম id কিন্তু ভিন্ন সংখ্যক ছবির পোস্ট একে অপরের সাথে merge হয় না।
+
+## পরিবর্তিত ফাইল
+
+| ফাইল | কী বদলেছে |
+|---|---|
+| `models/PostAlbum.js` | **নতুন** — অ্যালবামের অংশগুলো জমানোর অস্থায়ী কালেকশন (২ মিনিটে নিজে মুছে যায়) |
+| `models/Task.js` | `targetMessageIds` ফিল্ড |
+| `bot/bot.js` | `normalizeMessageIds`, `getTaskMessageIds`, `forwardPostMessages`, `recordAlbumPart`; forwarded-post middleware, `handlePostForward`, `postadmin_recheck`, `Task.create`, `findMergeableTask`, `deliverViewTask` |
