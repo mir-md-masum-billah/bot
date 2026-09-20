@@ -85,6 +85,14 @@ const TaskSchema = new mongoose.Schema(
     // Coins paid to a user for each completion
     pricePerAction: { type: Number, required: true },
 
+    // "🤖 Bot" tasks only: when true, the worker must submit a screenshot
+    // proving they followed `conditionText`, and completion isn't credited
+    // until that screenshot is approved (by the owner, an admin override,
+    // or the auto-approve cron). When false (the default — "Bot start
+    // only"), the existing trust-based instant Check flow is unchanged.
+    requiresProof: { type: Boolean, default: false },
+    conditionText: { type: String, default: "" },
+
     // Total subscribers/views requested and how many completed so far
     goalCount: { type: Number, required: true },
     completedCount: { type: Number, default: 0 },

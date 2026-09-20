@@ -3,6 +3,7 @@ import { message } from "telegraf/filters";
 import { dbConnect } from "../lib/db.js";
 import User from "../models/User.js";
 import Task from "../models/Task.js";
+import Submission from "../models/Submission.js";
 import PostAlbum from "../models/PostAlbum.js";
 import Transaction from "../models/Transaction.js";
 import {
@@ -36,6 +37,8 @@ import {
   addBotToChannelMenu,
   afterViewMenu,
   reportReasonMenu,
+  botTaskTypeMenu,
+  submissionReviewMenu,
 } from "./keyboards.js";
 import { nextCounterValue } from "../models/Counter.js";
 
@@ -53,6 +56,10 @@ const BASE_MIN_PRICE = 750;
 const PREMIUM_MIN_PRICE = 1400;
 const LANGUAGE_FILTER_SURCHARGE = 100;
 const RECOMMENDED_SURCHARGE = 150;
+
+// How long a worker's screenshot sits waiting on the owner before the cron
+// route (pages/api/cron/auto-approve-submissions.js) approves it for them.
+const PROOF_AUTO_APPROVE_HOURS = Number(process.env.PROOF_AUTO_APPROVE_HOURS || 24);
 
 function computeMinPrice(audienceMode, languages) {
   let min = audienceMode === "premium_only" ? PREMIUM_MIN_PRICE : BASE_MIN_PRICE;
@@ -174,7 +181,122 @@ async function clearSession(user) {
 // Sends a task-owner alert unless they muted it — either for this one task
 // (👤 detail screen → Disable notification) or globally (cabinet → Disable
 // notifications). Never throws: a blocked bot must not break the caller.
-async function notifyTaskOwner(task, text) {
+// Notifies one specific worker (as opposed to notifyTaskOwner, which
+// respects the task's/owner's mute settings). Used for submission
+// approve/reject/warning messages, which the worker should always see.
+async function notifyWorker(telegramId, text) {
+  try {
+    await bot.telegram.sendMessage(telegramId, text);
+  } catch (e) {
+    // Worker blocked the bot — nothing to do.
+  }
+}
+
+// Shared by: owner tapping ✅ Approve, an admin dashboard override to
+// "approve", and the auto-approve cron. Does the same atomic
+// findOneAndUpdate the old trust-based verify_ flow always used, so a
+// proof-required task can never overfill its goalCount either.
+export async function finalizeSubmissionApproval(submission, decidedBy) {
+  await dbConnect();
+  const task = await Task.findById(submission.taskId);
+  const worker = await User.findOne({ telegramId: submission.workerTelegramId });
+  if (!task || !worker) return { ok: false, reason: "Task or worker no longer exists." };
+
+  const updatedTask = await Task.findOneAndUpdate(
+    {
+      _id: task._id,
+      completedBy: { $ne: worker.telegramId },
+      $expr: { $lt: ["$completedCount", "$goalCount"] },
+    },
+    {
+      $inc: { completedCount: 1 },
+      $push: {
+        completedBy: worker.telegramId,
+        completions: { telegramId: worker.telegramId, completedAt: new Date() },
+      },
+    },
+    { new: true }
+  );
+
+  submission.status = "approved";
+  submission.decidedBy = decidedBy;
+  submission.decidedAt = new Date();
+  await submission.save();
+
+  // The task may already be full/deleted by the time this runs (e.g. two
+  // submissions approved back to back) — the worker's proof was still
+  // genuine, so they're paid regardless; it just doesn't move the goal bar.
+  if (updatedTask && updatedTask.completedCount >= updatedTask.goalCount && updatedTask.status === "active") {
+    updatedTask.status = "completed";
+    await updatedTask.save();
+  }
+
+  await creditEarned(worker, task.pricePerAction, "Bot task screenshot approved", task._id);
+  await notifyWorker(
+    worker.telegramId,
+    `✅ Your screenshot for "${task.targetChatTitle || task.targetChatId}" was approved.\n` +
+      `💵 You received +${task.pricePerAction.toLocaleString()} GRAM.`
+  );
+  return { ok: true };
+}
+
+// Deducts one task's pricePerAction from `penalizeTelegramId` (never below
+// 0, earned coins first then donated) and sends them a warning message.
+// Used both for an ordinary rejection (worker pays) and for an admin
+// override of a bad-faith rejection (owner pays instead — see
+// pages/api/admin/submissions.js).
+export async function penalizeAndWarn(penalizeTelegramId, task, reason) {
+  await dbConnect();
+  const penalized = await User.findOne({ telegramId: penalizeTelegramId });
+  if (!penalized || !task) return;
+
+  let amount = task.pricePerAction;
+  const fromEarned = Math.min(penalized.earnedBalance, amount);
+  penalized.earnedBalance -= fromEarned;
+  amount -= fromEarned;
+  if (amount > 0) {
+    penalized.donatedBalance = Math.max(0, penalized.donatedBalance - amount);
+  }
+  await penalized.save();
+  await Transaction.create({
+    telegramId: penalized.telegramId,
+    type: "submission_penalty",
+    amount: -task.pricePerAction,
+    relatedTaskId: task._id,
+    note: reason,
+  });
+  await notifyWorker(
+    penalized.telegramId,
+    `⚠️ Warning — "${task.targetChatTitle || task.targetChatId}": ${reason}\n` +
+      `-${task.pricePerAction.toLocaleString()} GRAM has been deducted from your balance.`
+  );
+}
+
+// Shared by: owner tapping ❌ Reject, and an admin override that turns an
+// already-approved/auto-approved submission back into a rejection. Always
+// penalizes the WORKER (the one who submitted the fake/invalid proof) and
+// always leaves the submission's final status as "rejected".
+export async function applyRejectionPenalty(submission, reason, penalizeTelegramId, decidedBy) {
+  await dbConnect();
+  const task = await Task.findById(submission.taskId);
+
+  submission.status = "rejected";
+  submission.rejectReason = reason || submission.rejectReason || "No reason given.";
+  submission.decidedBy = decidedBy;
+  submission.decidedAt = new Date();
+  await submission.save();
+
+  if (penalizeTelegramId && task) {
+    await penalizeAndWarn(
+      penalizeTelegramId,
+      task,
+      `Your submission was rejected. Reason: ${submission.rejectReason}`
+    );
+  }
+  return { ok: true };
+}
+
+export async function notifyTaskOwner(task, text) {
   try {
     if (task.notifyOwner === false) return;
     const owner = await User.findOne({ telegramId: task.ownerTelegramId });
@@ -952,11 +1074,38 @@ bot.hears("🤖 Bot", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   if (user.sessionState !== "promote_type_menu") return;
   await tryDeleteUserMessage(ctx);
-  await setSession(user, "awaiting_price", { type: "bot" });
+  await setSession(user, "choosing_bot_task_type", { type: "bot" });
+  await ctx.reply(
+    "🤖 Choose the task type:\n\n" +
+      "▶️ Bot start only — the worker opens the bot and presses Start. No other actions, and Check pays out instantly.\n\n" +
+      "📝 With additional conditions — you can request additional actions (e.g. subscribing to sponsors). " +
+      "The worker must send a screenshot, and it's only paid once approved.",
+    botTaskTypeMenu()
+  );
+});
+
+bot.hears("▶️ Bot start only", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "choosing_bot_task_type") return;
+  await tryDeleteUserMessage(ctx);
+  await setSession(user, "awaiting_price", { type: "bot", requiresProof: false });
   await ctx.reply(
     `${TYPE_LABELS.bot} selected.\n\n` +
       `💡 Send the price (in coins) you want to pay per completion.\n` +
       `Tip: check the "Earn" section for current prices — higher prices get completed faster.`
+  );
+});
+
+bot.hears("📝 With additional conditions", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "choosing_bot_task_type") return;
+  await tryDeleteUserMessage(ctx);
+  await setSession(user, "awaiting_bot_condition_text", { type: "bot", requiresProof: true });
+  await ctx.reply(
+    "📝 Describe the task conditions — what the worker must do after starting the bot. " +
+      "For example: press a button, complete a captcha, subscribe to sponsors.\n\n" +
+      "🚫 You cannot require: personal data (name, phone number, email, documents, KYC), or any payment/top-up.\n\n" +
+      "No more than 400 characters."
   );
 });
 
@@ -2235,6 +2384,29 @@ bot.action(/verify_(.+)/, async (ctx) => {
     return;
   }
 
+  // "🤖 Bot — with additional conditions" tasks aren't paid on trust: the
+  // worker has to submit a screenshot first, and Check here just opens
+  // that flow instead of crediting anything.
+  if (task.requiresProof) {
+    const pendingAlready = await Submission.findOne({
+      taskId: task._id,
+      workerTelegramId: user.telegramId,
+      status: "pending",
+    });
+    if (pendingAlready) {
+      await ctx.answerCbQuery("You already sent a screenshot for this task — waiting on review.");
+      return;
+    }
+    await ctx.answerCbQuery();
+    await setSession(user, "awaiting_proof_photo", { proofTaskId: String(task._id) });
+    await ctx.reply(
+      `📸 Send a screenshot clearly showing that you completed the task according to the conditions.\n\n` +
+        `📋 Conditions:\n${task.conditionText || "(none specified)"}\n\n` +
+        `⚠️ Fake/cheating screenshots get your submission rejected and the coins clawed back.`
+    );
+    return;
+  }
+
   // getChatMember only answers "is this user in the chat" — which is not
   // the action being paid for on post/bot/reaction/boost tasks (a reaction
   // and a premium boost aren't readable through the Bot API at all, and a
@@ -2654,6 +2826,36 @@ bot.on("text", async (ctx) => {
     return;
   }
 
+  if (state === "awaiting_bot_condition_text") {
+    if (text.length > 400) {
+      await ctx.reply("Too long — please keep it under 400 characters.");
+      return;
+    }
+    await setSession(user, "awaiting_price", {
+      ...user.sessionData,
+      conditionText: text,
+    });
+    await ctx.reply(
+      `${TYPE_LABELS.bot} (with additional conditions) selected.\n\n` +
+        `💡 Send the price (in coins) you want to pay per completion — screenshots are reviewed, so ` +
+        `pricing a bit above the "Bot start only" minimum tends to get done faster.`
+    );
+    return;
+  }
+
+  if (state === "awaiting_reject_reason") {
+    const submission = await Submission.findById(user.sessionData.submissionId);
+    if (!submission || submission.status !== "pending" || submission.ownerTelegramId !== user.telegramId) {
+      await clearSession(user);
+      await ctx.reply("That submission isn't waiting on you anymore.");
+      return;
+    }
+    await applyRejectionPenalty(submission, text.slice(0, 300), submission.workerTelegramId, "owner");
+    await clearSession(user);
+    await ctx.reply("❌ Rejected. The worker has been notified with your reason.");
+    return;
+  }
+
   // ---- new promote-wizard states (channel/group/views/boost/reactions) ----
 
   if (state === "choosing_audience_languages") {
@@ -2741,6 +2943,92 @@ bot.on("text", async (ctx) => {
   await ctx.reply("Use the menu below 👇", mainMenu());
 });
 
+// ---------- 🤖 Bot task screenshot proof (submit / owner review) ----------
+
+bot.on(message("photo"), async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  if (user.sessionState !== "awaiting_proof_photo") return;
+
+  await dbConnect();
+  const task = await Task.findById(user.sessionData.proofTaskId);
+  if (!task || task.status !== "active" || !task.requiresProof) {
+    await clearSession(user);
+    await ctx.reply("This task isn't available anymore.");
+    return;
+  }
+  if (task.completedBy.includes(user.telegramId)) {
+    await clearSession(user);
+    await ctx.reply("You already completed this task.");
+    return;
+  }
+
+  const photos = ctx.message.photo;
+  const fileId = photos[photos.length - 1].file_id; // largest resolution
+
+  const submission = await Submission.create({
+    taskId: task._id,
+    ownerTelegramId: task.ownerTelegramId,
+    workerTelegramId: user.telegramId,
+    photoFileId: fileId,
+    submissionNumber: await nextCounterValue("submissions", 1),
+    expiresAt: new Date(Date.now() + PROOF_AUTO_APPROVE_HOURS * 60 * 60 * 1000),
+  });
+
+  await clearSession(user);
+  await ctx.reply(
+    "✅ Screenshot sent for review. You'll be notified once it's approved or rejected " +
+      `(auto-approved after ${PROOF_AUTO_APPROVE_HOURS}h if the owner doesn't respond).`
+  );
+
+  try {
+    await bot.telegram.sendPhoto(task.ownerTelegramId, fileId, {
+      caption:
+        `📋 New submission for your task\n\n` +
+        `🤖 ${task.targetChatTitle || task.targetChatId}\n` +
+        `📝 Conditions: ${task.conditionText || "(none specified)"}\n` +
+        `💵 Reward: ${task.pricePerAction.toLocaleString()} GRAM\n\n` +
+        `Review this screenshot and approve or reject it. If you don't respond within ` +
+        `${PROOF_AUTO_APPROVE_HOURS}h, it will auto-approve.`,
+      ...submissionReviewMenu(submission._id),
+    });
+  } catch (e) {
+    // Owner blocked the bot — it'll still get picked up by the auto-approve cron.
+  }
+});
+
+bot.action(/submission_approve_(.+)/, async (ctx) => {
+  await dbConnect();
+  const submission = await Submission.findById(ctx.match[1]);
+  if (!submission || submission.status !== "pending") {
+    await ctx.answerCbQuery("Already handled.");
+    return;
+  }
+  if (submission.ownerTelegramId !== ctx.from.id) {
+    await ctx.answerCbQuery("This isn't your task.");
+    return;
+  }
+  await finalizeSubmissionApproval(submission, "owner");
+  await ctx.answerCbQuery("Approved!");
+  await ctx.editMessageCaption(`${ctx.callbackQuery.message.caption}\n\n✅ Approved.`).catch(() => {});
+});
+
+bot.action(/submission_reject_(.+)/, async (ctx) => {
+  await dbConnect();
+  const submission = await Submission.findById(ctx.match[1]);
+  if (!submission || submission.status !== "pending") {
+    await ctx.answerCbQuery("Already handled.");
+    return;
+  }
+  if (submission.ownerTelegramId !== ctx.from.id) {
+    await ctx.answerCbQuery("This isn't your task.");
+    return;
+  }
+  const user = await getOrCreateUser(ctx);
+  await setSession(user, "awaiting_reject_reason", { submissionId: String(submission._id) });
+  await ctx.answerCbQuery();
+  await ctx.reply("✏️ Send the reason for rejecting this submission (the worker will see it).");
+});
+
 bot.action("count_custom", async (ctx) => {
   const user = await getOrCreateUser(ctx);
   await setSession(user, "awaiting_custom_count", user.sessionData);
@@ -2818,7 +3106,7 @@ async function handleChatInput(ctx, user, message) {
   }
 
   await dbConnect();
-  const { type, price, count } = user.sessionData;
+  const { type, price, count, requiresProof, conditionText } = user.sessionData;
   const spend = await spendForTask(user, price * count);
   if (!spend.ok) {
     if (spend.invalid) {
@@ -2838,6 +3126,7 @@ async function handleChatInput(ctx, user, message) {
     type,
     targetChatId: String(chatId),
     pricePerAction: price,
+    requiresProof: Boolean(requiresProof),
     status: { $in: ["active", "completed"] },
   });
 
@@ -2869,6 +3158,8 @@ async function handleChatInput(ctx, user, message) {
     targetChatUsername: chatInfo.username,
     pricePerAction: price,
     goalCount: count,
+    requiresProof: Boolean(requiresProof),
+    conditionText: conditionText || "",
   });
 
   await clearSession(user);

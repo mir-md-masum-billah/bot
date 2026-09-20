@@ -12,6 +12,7 @@ const TransactionSchema = new mongoose.Schema(
         "refund", // task deleted / paused refund
         "commission", // commission deducted
         "admin_adjust", // manual admin balance change
+        "submission_penalty", // rejected bot-task screenshot (worker) or overturned owner rejection (owner)
       ],
       required: true,
     },

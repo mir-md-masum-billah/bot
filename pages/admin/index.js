@@ -15,22 +15,42 @@ export default function AdminDashboard() {
   const [stats, setStats] = useState(null);
   const [tasks, setTasks] = useState([]);
   const [users, setUsers] = useState([]);
+  const [submissions, setSubmissions] = useState([]);
+  const [subFilter, setSubFilter] = useState("");
   const router = useRouter();
 
   async function loadAll() {
-    const [s, t, u] = await Promise.all([
+    const [s, t, u, sub] = await Promise.all([
       fetch("/api/admin/stats").then((r) => r.json()),
       fetch("/api/admin/tasks").then((r) => r.json()),
       fetch("/api/admin/users").then((r) => r.json()),
+      fetch(`/api/admin/submissions${subFilter ? `?status=${subFilter}` : ""}`).then((r) => r.json()),
     ]);
     setStats(s);
     setTasks(t);
     setUsers(u);
+    setSubmissions(sub);
   }
 
   useEffect(() => {
     loadAll();
-  }, []);
+  }, [subFilter]);
+
+  async function reviewSubmission(id, action) {
+    const note = prompt(
+      action === "reject"
+        ? "Reason to show the worker (required):"
+        : "Optional note for this decision:",
+      ""
+    );
+    if (action === "reject" && !note) return;
+    await fetch("/api/admin/submissions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, action, note: note || undefined }),
+    });
+    loadAll();
+  }
 
   async function updateTask(id, patch) {
     await fetch("/api/admin/tasks", {
@@ -70,6 +90,12 @@ export default function AdminDashboard() {
           </button>
           <button style={tab === "users" ? s.navActive : s.navBtn} onClick={() => setTab("users")}>
             Users
+          </button>
+          <button
+            style={tab === "submissions" ? s.navActive : s.navBtn}
+            onClick={() => setTab("submissions")}
+          >
+            Submissions
           </button>
         </nav>
       </header>
@@ -168,6 +194,72 @@ export default function AdminDashboard() {
               {users.length === 0 && (
                 <tr>
                   <td style={s.td} colSpan={6}>No users yet.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {tab === "submissions" && (
+        <div style={s.card}>
+          <div style={{ marginBottom: "12px", display: "flex", gap: "8px" }}>
+            {["", "pending", "approved", "rejected"].map((f) => (
+              <button
+                key={f || "all"}
+                style={subFilter === f ? s.navActive : s.navBtn}
+                onClick={() => setSubFilter(f)}
+              >
+                {f || "All"}
+              </button>
+            ))}
+          </div>
+          <table style={s.table}>
+            <thead>
+              <tr>
+                <th style={s.th}>Photo</th>
+                <th style={s.th}>Worker</th>
+                <th style={s.th}>Owner</th>
+                <th style={s.th}>Status</th>
+                <th style={s.th}>Decided by</th>
+                <th style={s.th}>Reason</th>
+                <th style={s.th}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {submissions.map((sub) => (
+                <tr key={sub._id}>
+                  <td style={s.td}>
+                    <a href={`/api/admin/submission-photo/${sub.photoFileId}`} target="_blank" rel="noreferrer">
+                      <img
+                        src={`/api/admin/submission-photo/${sub.photoFileId}`}
+                        alt="submission"
+                        style={{ width: 60, height: 60, objectFit: "cover", borderRadius: 6 }}
+                      />
+                    </a>
+                  </td>
+                  <td style={s.td}>{sub.workerTelegramId}</td>
+                  <td style={s.td}>{sub.ownerTelegramId}</td>
+                  <td style={s.td}>
+                    <span style={s.badge(sub.status === "approved" ? "active" : sub.status === "rejected" ? "paused" : "")}>
+                      {sub.status}
+                    </span>
+                    {sub.adminOverrode && <span style={{ marginLeft: 6, color: "#f87171", fontSize: 11 }}>overridden</span>}
+                  </td>
+                  <td style={s.td}>{sub.decidedBy || "—"}</td>
+                  <td style={s.td}>{sub.adminNote || sub.rejectReason || "—"}</td>
+                  <td style={s.td}>
+                    <button style={s.smallBtn} onClick={() => reviewSubmission(sub._id, "approve")}>
+                      Approve
+                    </button>
+                    <button style={s.smallBtnDanger} onClick={() => reviewSubmission(sub._id, "reject")}>
+                      Reject
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {submissions.length === 0 && (
+                <tr>
+                  <td style={s.td} colSpan={7}>No submissions.</td>
                 </tr>
               )}
             </tbody>

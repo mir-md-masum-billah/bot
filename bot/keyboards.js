@@ -40,6 +40,23 @@ export const earnTypeMenu = (counts = {}) => {
   ]);
 };
 
+// Shown right after "🤖 Bot" is picked in 📢 Promote, mirroring PR GRAM's
+// "Choose the task type" step.
+export const botTaskTypeMenu = () =>
+  Markup.keyboard([
+    ["▶️ Bot start only", "📝 With additional conditions"],
+    ["⬅️ Back"],
+  ]).resize();
+
+// Sent to the task owner alongside the worker's screenshot.
+export const submissionReviewMenu = (submissionId) =>
+  Markup.inlineKeyboard([
+    [
+      Markup.button.callback("✅ Approve", `submission_approve_${submissionId}`),
+      Markup.button.callback("❌ Reject", `submission_reject_${submissionId}`),
+    ],
+  ]);
+
 export const subscriberCountMenu = () =>
   Markup.inlineKeyboard([
     [
